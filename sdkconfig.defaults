@@ -1,0 +1,43 @@
+# =====================================================================
+# WT32-ETH01 GPS/PPS NTP Server — 工程默认配置
+# 说明：sdkconfig 已存在时本文件不会覆盖其中已有项；
+#       若修改本文件后想让默认值生效，请删除 sdkconfig 后重新
+#       idf.py set-target esp32 && idf.py build
+# =====================================================================
+
+CONFIG_IDF_TARGET="esp32"
+
+# ---------------- 以太网：ESP32 内置 EMAC + 板载 LAN8720 ----------------
+CONFIG_ETH_USE_ESP32_EMAC=y
+
+# ---------------- 主频：240MHz，降低中断响应抖动 ------------------------
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# ---------------- lwIP：并发与缓冲 -------------------------------------
+# 开启 core locking 后，NTP 任务可以直接在自身上下文调用 lwIP，
+# 不必切到 tcpip 线程，发送时戳更贴近实际上线路时刻
+CONFIG_LWIP_TCPIP_CORE_LOCKING=y
+CONFIG_LWIP_TCPIP_CORE_LOCKING_INPUT=y
+# UDP 接收队列深度：这是 lwIP 里 UDP 真正的"缓冲"，
+# 默认 6 太浅，突发 NTP 查询会直接丢包
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+# 允许 setsockopt(SO_RCVBUF)
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_LWIP_MAX_SOCKETS=12
+CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
+# lwIP tcpip 线程固定到 CPU1（网络核），
+# 让 CPU0 专心跑 PPS 中断 / 时基伺服 / GPS 串口，减少中断响应抖动
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY=0x1
+
+# ---------------- 看门狗 ------------------------------------------------
+# 由 app_main() 显式 esp_task_wdt_init()（10s / panic），
+# 因此这里关掉启动阶段自动初始化
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=n
+CONFIG_ESP_INT_WDT=y
+
+# ---------------- 日志 --------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
