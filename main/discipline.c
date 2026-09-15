@@ -29,6 +29,7 @@ static const char *TAG = "disc";
 
 #define PPS_RING      8                       /* 必须是 2 的幂 */
 #define PPS_RING_MASK (PPS_RING - 1)
+_Static_assert((PPS_RING & PPS_RING_MASK) == 0, "PPS_RING 必须是 2 的幂");
 
 /* 回绕安全的无符号差值（两个 uint64 时标之间） */
 #define TB_DELTA(now, before) ((uint64_t)((now) - (before)))
@@ -66,9 +67,13 @@ static volatile uint32_t s_cnt_late;
 static volatile uint32_t s_lag_us;      /* 最近一次配对的 NMEA 滞后（µs） */
 
 /* ---- 任务侧派生状态 ---- */
+/* 注意：s_seen_gga 由 GPS 任务在 discipline_on_fix() 里写、被其它任务经
+ * refresh_flags() 读，因此与 s_fix_tb 一样需要 volatile（跨任务可见性）。 */
 static bool     s_pps_ok;
 static bool     s_nmea_ok;
 static bool     s_fix_ok;
+static bool     s_fix_gate;       /* 是否把 GGA 定位质量当作硬条件（见 refresh_flags） */
+static volatile bool s_seen_gga;  /* 是否收到过 GGA（有些模块只输出 RMC） */
 static bool     s_locked;
 static uint32_t s_holdover_ms;
 static bool     s_hold_valid;     /* 是否收到过 PPS */
@@ -273,10 +278,15 @@ void discipline_on_nmea_second(uint32_t unix_sec, uint64_t est_start_tb)
             }
         }
 
-        s_lag_us = (uint32_t)(uint64_t)(est_start_tb - best_p);
+        /* 语句起始相对所配边沿的滞后。必须用有符号算：理论值 >= 0，但候选边沿
+         * 的选取允许语句起始落在边沿之前最多 CFG_NMEA_LAG_TOL_US（400ms），
+         * 无符号减法一旦下溢就会变成 4e9 级别的"滞后"，既打印出荒谬数值，
+         * 又会误触发下面的"滞后超上限 -> 强制重对齐"，把本来正确的锚点搬走。 */
+        int64_t lag_us_s = (int64_t)(est_start_tb - best_p);
+        s_lag_us = (lag_us_s > 0) ? (uint32_t)(uint64_t)lag_us_s : 0u;
 
         if (i64abs(best_d) <= (int64_t)CFG_NMEA_MATCH_US &&
-            s_lag_us <= (uint32_t)CFG_NMEA_MAX_LAG_US) {
+            lag_us_s <= (int64_t)CFG_NMEA_MAX_LAG_US) {
             if (late) {
                 /* 9600 波特 + GSV 全开时这是常态，不是故障：只记数，不刷日志 */
                 s_cnt_late++;
@@ -318,7 +328,7 @@ void discipline_on_nmea_second(uint32_t unix_sec, uint64_t est_start_tb)
             }
 
             s_cnt_mismatch++;
-            if (s_lag_us > (uint32_t)CFG_NMEA_MAX_LAG_US) {
+            if (lag_us_s > (int64_t)CFG_NMEA_MAX_LAG_US) {
                 /* 配对到明显过期的边沿：强制重置 */
                 reanchor_locked(p0, target);
                 s_cnt_resync++;
@@ -350,12 +360,15 @@ void discipline_on_nmea_second(uint32_t unix_sec, uint64_t est_start_tb)
 /* ====================== 定位质量刷新 =============================== */
 void discipline_on_fix(uint8_t fix_quality, uint8_t sats)
 {
+    uint64_t now = tb_now_us();
+    portENTER_CRITICAL(&s_lock);
+    /* 见过 GGA 就置位：用于区分"模块根本不输出 GGA"和"输出但定位不合格"，
+     * 前者不该把设备永久卡在 stratum 16（见 refresh_flags）。 */
+    s_seen_gga = true;
     if (fix_quality > 0 && sats >= CFG_GPS_MIN_SATS) {
-        uint64_t now = tb_now_us();
-        portENTER_CRITICAL(&s_lock);
         s_fix_tb = now;
-        portEXIT_CRITICAL(&s_lock);
     }
+    portEXIT_CRITICAL(&s_lock);
 }
 
 /* =========================== 取当前 UTC ============================ */
@@ -386,7 +399,11 @@ static void refresh_flags(uint64_t now)
                 (TB_DELTA(now, s_nmea_time_tb) < (uint64_t)CFG_FIX_TIMEOUT_MS * 1000ULL);
     s_fix_ok  = (s_fix_tb != 0) &&
                 (TB_DELTA(now, s_fix_tb) < (uint64_t)CFG_FIX_TIMEOUT_MS * 1000ULL);
-    s_locked  = s_anchored && s_pps_ok && s_nmea_ok && s_fix_ok;
+    /* 有些模块被裁成只输出 RMC（GGA 关闭）——那种情况下 s_fix_ok 永远是 false，
+     * 把它当硬条件会让设备永远停在 stratum 16。所以只有确实见过 GGA 时，
+     * 才把"定位质量"当作判据。 */
+    s_fix_gate = s_seen_gga ? s_fix_ok : true;
+    s_locked   = s_anchored && s_pps_ok && s_nmea_ok && s_fix_gate;
 
     /* 从未收到过 PPS 时，holdover 没有意义：以前这里填 0xFFFFFFFF
      * （显示为 4294967295ms ≈ 49 天），既不是真值也容易误判成"失锁很久"，
@@ -403,9 +420,6 @@ void discipline_get_status(disc_status_t *st)
 
     portENTER_CRITICAL(&s_lock);
     st->anchored     = s_anchored;
-    st->last_pps_tb  = s_last_pps_tb;
-    st->anchor_tb    = s_anchor_tb;
-    st->anchor_utc_us = s_anchor_utc_us;
     st->ppb          = s_ppb;
     st->offset_us    = s_offset_us;
     st->jitter_us    = s_jitter_q3 / 8;
@@ -423,12 +437,17 @@ void discipline_get_status(disc_status_t *st)
 
     st->pps_ok       = s_pps_ok;
     st->nmea_ok      = s_nmea_ok;
+    /* 【必须有】以前这里漏了 fix_ok，而失锁日志会打印它 —— 打出来的是
+     * 未初始化局部变量的栈垃圾，最容易在排障时误导判断。 */
+    st->fix_ok       = s_fix_ok;
     st->locked       = s_locked;
     st->holdover_ms  = s_holdover_ms;
     st->holdover_valid = s_hold_valid;
 
-    /* 没有绝对时间来源（没对齐过 / 长时间没拿到有效 RMC）就不能自称 stratum 1 */
-    if (!st->anchored || !st->nmea_ok) {
+    /* 没有绝对时间来源（没对齐过 / 长时间没拿到有效 RMC / 定位不合格）就不能
+     * 自称 stratum 1。判据与 locked 保持一致，避免出现"面板显示 UNLOCKED、
+     * 却对外宣告 stratum=1 / LI=0"这种自相矛盾的状态。 */
+    if (!st->anchored || !st->nmea_ok || !s_fix_gate) {
         st->stratum      = 16;
         st->li           = 3;                       /* 未同步 */
         st->root_disp_us = 10000000;                /* 10 s */
@@ -455,15 +474,6 @@ void discipline_get_status(disc_status_t *st)
         disp = 10000000u;
     }
     st->root_disp_us = disp;
-}
-
-bool discipline_locked(void)
-{
-    uint64_t now = tb_now_us();
-    portENTER_CRITICAL(&s_lock);
-    refresh_flags(now);
-    portEXIT_CRITICAL(&s_lock);
-    return s_locked;
 }
 
 uint32_t discipline_ref_sec(void)
@@ -519,9 +529,14 @@ void discipline_init(void)
     s_cnt_mismatch  = 0;
     s_cnt_late      = 0;
     s_lag_us        = 0;
+    s_seen_gga      = false;
+    s_fix_gate      = true;
 
     /* 时基链路固定在 CORE_TIME：PPS 中断就在同一个核上，
      * 不会被 lwIP / HTTP 的长临界区推迟 */
-    xTaskCreatePinnedToCore(discipline_task, "disc", 3072, NULL, 20, NULL, CFG_CORE_TIME);
+    if (xTaskCreatePinnedToCore(discipline_task, "disc", 3072, NULL, 20, NULL,
+                                CFG_CORE_TIME) != pdPASS) {
+        ESP_LOGE(TAG, "disc 任务创建失败（内存不足？）");
+    }
     ESP_LOGI(TAG, "时基初始化完成 (esp_timer 64bit us, PPS->IO%d)", CFG_PPS_GPIO);
 }

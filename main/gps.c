@@ -17,10 +17,19 @@
 
 static const char *TAG = "gps";
 
-static const uint32_t s_baud_list[CFG_GPS_BAUD_COUNT] = CFG_GPS_BAUD_LIST;
+static const uint32_t s_baud_list[] = CFG_GPS_BAUD_LIST;
+/* 候选表长度以数组本身为准（下面统一用 GPS_BAUD_N），CFG_GPS_BAUD_COUNT
+ * 只作编译期一致性检查，避免"少配一个波特率就静默只试前几个"。 */
+#define GPS_BAUD_N (sizeof(s_baud_list) / sizeof(s_baud_list[0]))
+_Static_assert(GPS_BAUD_N == CFG_GPS_BAUD_COUNT,
+               "CFG_GPS_BAUD_COUNT 与 CFG_GPS_BAUD_LIST 的元素个数不一致");
 
 /* ---------------- 运行状态 ---------------- */
+/* s_st / s_baud 由 GPS 任务独占更新；其他任务（HTTP 面板、串口诊断）读
+ * s_st_pub 快照，避免看到"半新半旧"的字段组合。发布点见 publish_status()。 */
 static gps_status_t s_st;
+static portMUX_TYPE s_st_lock = portMUX_INITIALIZER_UNLOCKED;
+static gps_status_t s_st_pub;
 static uint32_t     s_baud = 0;
 static bool         s_baud_locked = false;
 static uint32_t     s_byte_us_q16;         /* 每字节耗时(µs) 的 Q16 定点 */
@@ -90,11 +99,17 @@ static bool raw_is_wanted(const char *line)
            (strncmp(line + 3, "ZDA", 3) == 0);
 }
 
+/* raw 缓冲的一致性保护（seqlock）：写侧在首尾各自增一次序号，读者两次读取
+ * 序号相同且为偶数才算拿到稳定快照。这样 GPS 任务写缓冲时不必抢锁，
+ * 不会给 NMEA 时戳引入额外抖动。 */
+static volatile uint32_t s_raw_seq;
+
 static void raw_store(const char *line)
 {
     char  *dst = s_raw[s_raw_head];
     size_t i   = 0;
 
+    s_raw_seq++;
     while (line[i] && i < GPS_RAW_LINE_LEN - 1U) {
         char c = line[i];
         if (c == '\r' || c == '\n') {
@@ -113,22 +128,33 @@ static void raw_store(const char *line)
     if (s_raw_count < GPS_RAW_LINES) {
         s_raw_count++;
     }
+    s_raw_seq++;
 }
 
 int gps_get_last_nmea(char dst[][GPS_RAW_LINE_LEN], int max)
 {
-    int start = (int)s_raw_head - (int)s_raw_count;
-    int n     = 0;
+    int start, n;
 
-    if (start < 0) {
-        start += GPS_RAW_LINES;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        uint32_t seq0 = s_raw_seq;
+        if (seq0 & 1u) {
+            continue;                       /* GPS 任务正在写入，重试 */
+        }
+        start = (int)s_raw_head - (int)s_raw_count;
+        n     = 0;
+        if (start < 0) {
+            start += GPS_RAW_LINES;
+        }
+        for (int i = 0; i < (int)s_raw_count && n < max; i++) {
+            int idx = (start + i) % GPS_RAW_LINES;
+            snprintf(dst[n], GPS_RAW_LINE_LEN, "%s", s_raw[idx]);
+            n++;
+        }
+        if (s_raw_seq == seq0) {
+            return n;                       /* 期间没有写入：快照一致 */
+        }
     }
-    for (int i = 0; i < (int)s_raw_count && n < max; i++) {
-        int idx = (start + i) % GPS_RAW_LINES;
-        snprintf(dst[n], GPS_RAW_LINE_LEN, "%s", s_raw[idx]);
-        n++;
-    }
-    return n;
+    return 0;   /* 连续两次都撞上写入：本次不返回数据，调用方下次再取 */
 }
 
 /* ====================== UBX 发送 / 接收 ============================ */
@@ -242,6 +268,8 @@ static void parse_gga(const char *line)
     s_st.fix_quality = (uint8_t)(fq < 0 ? 0 : (fq > 255 ? 255 : fq));
     s_st.sats_used   = (uint8_t)(sats < 0 ? 0 : (sats > 255 ? 255 : sats));
     s_st.hdop_x10    = (uint16_t)(hdop * 10.0f);
+    /* 与 discipline.c 的 s_fix_ok 用同一个条件（fq > 0 && sats >= CFG_GPS_MIN_SATS）：
+     * 本字段供面板/日志显示，那份用于 stratum/LI 判定。改判据时两处必须同步。 */
     s_st.fix_valid   = (fq > 0 && s_st.sats_used >= CFG_GPS_MIN_SATS);
 
     discipline_on_fix(s_st.fix_quality, s_st.sats_used);
@@ -277,15 +305,18 @@ static void handle_nmea(const char *line)
     if (!nmea_checksum_ok(line)) {
         return;
     }
+    /* 句子类型从第 3 个字符开始，短于 6 字节的畸形帧先挡掉：以前长度检查排在
+     * raw_is_wanted() / strncmp() 之后，短句会先被按偏移读取（虽不越界，但读到
+     * 的是 s_line 里的陈旧字节），判定结果不可信。 */
+    if (strlen(line) < 6) {
+        return;
+    }
     s_detect_hit = true;
     s_st.nmea_count++;
     if (raw_is_wanted(line)) {
         raw_store(line);
     }
     if (s_probe_mode) {
-        return;
-    }
-    if (strlen(line) < 6) {
         return;
     }
     if (strncmp(line + 3, "RMC", 3) == 0) {
@@ -399,6 +430,10 @@ static void pump_uart(uint32_t ms, bool probe)
     int64_t  t0 = esp_timer_get_time();
     s_probe_mode = probe;
     while (esp_timer_get_time() - t0 < (int64_t)ms * 1000LL) {
+        /* 探测窗口里可能连续几秒收不到任何字节：必须在这里喂狗。否则
+         * "5 个候选 × CFG_GPS_BAUD_PROBE_MS" 会一路攒到接近 TWDT 超时（10s），
+         * 没接 GPS 时表现为反复 panic 复位。 */
+        esp_task_wdt_reset();
         int n = uart_read_bytes(CFG_GPS_UART, b, sizeof(b), pdMS_TO_TICKS(10));
         if (n > 0) {
             uint64_t t_end = tb_now_us();
@@ -427,6 +462,37 @@ static bool probe_baud(uint32_t baud)
     update_byte_time();
     pump_uart(CFG_GPS_BAUD_PROBE_MS, true);
     return s_detect_hit;
+}
+
+/* 走一遍波特率候选，命中即锁定。若已知当前波特率，先试它 ——
+ * "模块只是短暂静默"时能立刻恢复，不必逐个降速。启动阶段与运行中
+ * 失联重探都走这里。全部失败时恢复原来的波特率设置（probe_baud 会把
+ * s_baud 改成刚试过的那个），保持"当前波特率"这个概念的连贯。 */
+static bool probe_baud_loop(void)
+{
+    uint32_t prev = s_baud;
+
+    if (prev != 0 && probe_baud(prev)) {
+        s_baud_locked = true;
+        return true;
+    }
+    for (int i = 0; i < (int)GPS_BAUD_N; i++) {
+        if ((uint32_t)s_baud_list[i] == prev) {
+            continue;                       /* 上面已经试过 */
+        }
+        if (probe_baud(s_baud_list[i])) {
+            s_baud_locked = true;
+            return true;
+        }
+    }
+
+    if (prev != 0) {
+        uart_set_baudrate(CFG_GPS_UART, prev);
+        s_baud = prev;
+        update_byte_time();
+    }
+    s_baud_locked = false;
+    return false;
 }
 
 #if CFG_GPS_SET_BAUD
@@ -572,6 +638,18 @@ static void send_ubx_config(void)
 }
 #endif /* CFG_GPS_SEND_UBX_CFG */
 
+/* 把当前状态发布给其他任务读（只在 GPS 任务上下文调用）。
+ * 整个结构体在临界区里拷贝，读者就不会看到"半新半旧"的字段组合；
+ * 调用频率与主循环相同（约 10ms 一次），开销可忽略。 */
+static void publish_status(void)
+{
+    portENTER_CRITICAL(&s_st_lock);
+    s_st_pub = s_st;
+    s_st_pub.baud        = s_baud;
+    s_st_pub.baud_locked = s_baud_locked;
+    portEXIT_CRITICAL(&s_st_lock);
+}
+
 /* ====================== 主任务 ===================================== */
 static void gps_task(void *arg)
 {
@@ -599,20 +677,15 @@ static void gps_task(void *arg)
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_LOGI(TAG, "UART%d 已启动: TX=IO%d RX=IO%d，自动波特率 %u..%u",
              CFG_GPS_UART, CFG_GPS_TX_GPIO, CFG_GPS_RX_GPIO,
-             (unsigned)s_baud_list[CFG_GPS_BAUD_COUNT - 1],
+             (unsigned)s_baud_list[GPS_BAUD_N - 1],
              (unsigned)s_baud_list[0]);
 
     /* ---- 自动波特率 ---- */
     while (!s_baud_locked) {
-        for (int i = 0; i < CFG_GPS_BAUD_COUNT && !s_baud_locked; i++) {
-            if (probe_baud(s_baud_list[i])) {
-                s_baud_locked = true;
-                ESP_LOGI(TAG, "GPS 波特率识别成功：%u baud", (unsigned)s_baud);
-            }
-        }
-        if (!s_baud_locked) {
+        if (probe_baud_loop()) {
+            ESP_LOGI(TAG, "GPS 波特率识别成功：%u baud", (unsigned)s_baud);
+        } else {
             ESP_LOGW(TAG, "未识别到 GPS 数据流，3 秒后重试...");
-            esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(3000));
         }
     }
@@ -629,7 +702,9 @@ static void gps_task(void *arg)
 #endif
 
     /* ---- 正常接收 ---- */
-    uint8_t buf[64];
+    uint8_t  buf[64];
+    uint32_t last_count  = s_st.nmea_count;
+    uint32_t last_active = (uint32_t)(tb_now_us() / 1000ULL);
     reset_parser();
     while (1) {
         int n = uart_read_bytes(CFG_GPS_UART, buf, sizeof(buf), pdMS_TO_TICKS(10));
@@ -646,6 +721,29 @@ static void gps_task(void *arg)
         static uint32_t s_last_leap_check = 0;
         static uint32_t s_last_leap_poll  = 0;
         uint32_t now_ms = (uint32_t)(tb_now_us() / 1000ULL);
+
+        /* ---- 串口失联自愈 ----
+         * 模块掉电重启（u-blox 会回到出厂 9600）、被换过、或厂商固件改了
+         * 波特率之后，固件若一直停在旧波特率就会永远收不到 NMEA、永久停在
+         * stratum 16 且无人值守时无法自愈。这里以"多久没有新增合法语句"
+         * 为判据重新探测（CFG_GPS_RELOCK_SEC = 0 可关闭）。 */
+        if (s_st.nmea_count != last_count) {
+            last_count  = s_st.nmea_count;
+            last_active = now_ms;
+        } else if (CFG_GPS_RELOCK_SEC > 0 &&
+                   (uint32_t)(now_ms - last_active) > (uint32_t)CFG_GPS_RELOCK_SEC * 1000u) {
+            last_active = now_ms;
+            ESP_LOGW(TAG, "%u 秒未收到合法 NMEA，重新探测波特率（当前 %u）",
+                     (unsigned)CFG_GPS_RELOCK_SEC, (unsigned)s_baud);
+            if (probe_baud_loop()) {
+                ESP_LOGI(TAG, "GPS 波特率已恢复：%u baud", (unsigned)s_baud);
+            } else {
+                ESP_LOGW(TAG, "重新探测失败，保持 %u baud 继续监听", (unsigned)s_baud);
+            }
+            s_st.baud        = s_baud;
+            s_st.baud_locked = s_baud_locked;
+            reset_parser();
+        }
 
 #if CFG_GPS_POLL_NAV_TIMEGPS
         /* 只读查询，不是配置写入：模块不支持就收不到，不会有任何副作用 */
@@ -664,6 +762,8 @@ static void gps_task(void *arg)
                 s_st.leap_mismatch = s_st.leap_valid && (s_st.leap_s != (int8_t)exp);
             }
         }
+
+        publish_status();
     }
 }
 
@@ -672,15 +772,19 @@ void gps_init(void)
     s_st.baud = (uint32_t)s_baud_list[0];
     s_st.leap_s = 0;
     s_st.leap_valid = false;
+    publish_status();          /* 先发布一次初值，面板不会看到全零状态 */
 
     /* 固定跑在 CORE_TIME（与 PPS 中断同核） */
-    xTaskCreatePinnedToCore(gps_task, "gps", CFG_GPS_TASK_STACK, NULL,
-                            CFG_GPS_TASK_PRIO, NULL, CFG_CORE_TIME);
+    if (xTaskCreatePinnedToCore(gps_task, "gps", CFG_GPS_TASK_STACK, NULL,
+                                CFG_GPS_TASK_PRIO, NULL, CFG_CORE_TIME) != pdPASS) {
+        ESP_LOGE(TAG, "gps 任务创建失败（内存不足？），GPS 授时不可用");
+    }
 }
 
 void gps_get_status(gps_status_t *st)
 {
-    *st = s_st;
-    st->baud = s_baud;
-    st->baud_locked = s_baud_locked;
+    /* 读发布快照（见 publish_status），不直接读 s_st */
+    portENTER_CRITICAL(&s_st_lock);
+    *st = s_st_pub;
+    portEXIT_CRITICAL(&s_st_lock);
 }

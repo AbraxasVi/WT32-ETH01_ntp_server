@@ -1,6 +1,8 @@
 /*
  * GPS（u-blox M8N 系列，带 PPS）串口接入层
  *  - 9600 ~ 115200 波特率自动识别（被动探测，不改模块）
+ *  - 串口长时间没有合法语句时自动重探波特率（CFG_GPS_RELOCK_SEC），
+ *    用于模块掉电重启 / 被换 / 固件改了波特率之后的无人值守自愈
  *  - 默认不向模块写入任何配置（CFG_GPS_SET_BAUD=0 / CFG_GPS_SEND_UBX_CFG=0），
  *    兼容 ROM 只读、厂商屏蔽 CFG 写入的模块
  *  - 解析 RMC(UTC 秒) / GGA(Fix Quality + 参与解算卫星数) / GSV(可见卫星数)

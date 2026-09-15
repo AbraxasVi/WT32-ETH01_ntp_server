@@ -29,12 +29,14 @@ CONFIG_LWIP_MAX_SOCKETS=12
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
 # lwIP tcpip 线程固定到 CPU1（网络核），
 # 让 CPU0 专心跑 PPS 中断 / 时基伺服 / GPS 串口，减少中断响应抖动
+# 只设 choice 项即可：CONFIG_LWIP_TCPIP_TASK_AFFINITY 由它推导，无需重复写
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y
-CONFIG_LWIP_TCPIP_TASK_AFFINITY=0x1
 
 # ---------------- 看门狗 ------------------------------------------------
-# 由 app_main() 显式 esp_task_wdt_init()（10s / panic），
-# 因此这里关掉启动阶段自动初始化
+# 超时值与 panic 行为由 app_main() 里的 esp_task_wdt_init() 决定
+# （见 main/config.h 的 CFG_WDT_TIMEOUT_MS），这里关掉启动阶段自动初始化。
+# 说明：ESP_TASK_WDT_PANIC / TIMEOUT_S 等选项 depends on ESP_TASK_WDT_INIT，
+# 关掉后它们在 menuconfig 中不可见，也就不可能出现第二处"事实来源"。
 CONFIG_ESP_TASK_WDT_EN=y
 CONFIG_ESP_TASK_WDT_INIT=n
 CONFIG_ESP_INT_WDT=y

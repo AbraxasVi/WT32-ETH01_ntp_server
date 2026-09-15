@@ -112,13 +112,17 @@ void app_main(void)
 
     /* 时基与伺服先起来，PPS 中断一挂上就能记录 */
     discipline_init();
-    xTaskCreatePinnedToCore(pps_init_task, "pps_init", 2048, NULL,
-                            configMAX_PRIORITIES - 5, NULL, CFG_CORE_TIME);
+    if (xTaskCreatePinnedToCore(pps_init_task, "pps_init", 2048, NULL,
+                                configMAX_PRIORITIES - 5, NULL, CFG_CORE_TIME) != pdPASS) {
+        ESP_LOGE(TAG, "pps_init 任务创建失败：PPS 中断不会安装，设备无法授时");
+    }
 
     /* 以太网初始化放到 CORE_NET：EMAC 中断 + RX 任务就落在 CPU1，
      * 和 lwIP tcpip 线程同核，时间核保持干净 */
-    xTaskCreatePinnedToCore(eth_init_task, "eth_init", 4096, NULL,
-                            configMAX_PRIORITIES - 6, NULL, CFG_CORE_NET);
+    if (xTaskCreatePinnedToCore(eth_init_task, "eth_init", 4096, NULL,
+                                configMAX_PRIORITIES - 6, NULL, CFG_CORE_NET) != pdPASS) {
+        ESP_LOGE(TAG, "eth_init 任务创建失败：以太网不会初始化");
+    }
 
     gps_init();
     ntp_server_start();

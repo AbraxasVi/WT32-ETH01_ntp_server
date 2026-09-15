@@ -21,8 +21,12 @@ typedef struct {
     bool      anchored;      /* 已知绝对 UTC（至少对齐过一次）          */
     bool      pps_ok;        /* CFG_PPS_TIMEOUT_MS 内见过 PPS           */
     bool      nmea_ok;       /* CFG_FIX_TIMEOUT_MS 内见过有效 RMC       */
-    bool      fix_ok;        /* CFG_FIX_TIMEOUT_MS 内见过合格定位(GGA)  */
-    bool      locked;        /* 三者同时成立                            */
+    bool      fix_ok;        /* CFG_FIX_TIMEOUT_MS 内见过合格定位(GGA)。
+                              * 这是"原始探测结果"；只有确实收到过 GGA 时才
+                              * 参与判据（见下面的 locked）                */
+    bool      locked;        /* anchored && pps_ok && nmea_ok && fix_gate 同时成立。
+                              * fix_gate = 收到过 GGA ? fix_ok : true
+                              * （模块只输出 RMC 时不把 GGA 质量当硬条件）  */
     uint32_t  holdover_ms;   /* 距上一次有效 PPS 的时间；从未见过 PPS 时为 0 */
     bool      holdover_valid;/* false = 从未收到过 PPS，holdover_ms 无意义   */
     int64_t   offset_us;     /* 最近一次 PPS 相位误差（真值 - 本地估计）*/
@@ -30,9 +34,6 @@ typedef struct {
     int32_t   ppb;           /* 当前频率修正（parts per billion）       */
     uint32_t  pps_total;     /* 累计 PPS 数                             */
     uint32_t  pps_missed;    /* 累计漏掉的 PPS（间隔推算）              */
-    uint64_t  last_pps_tb;
-    uint64_t  anchor_tb;
-    int64_t   anchor_utc_us;
     uint32_t  stratum;       /* RFC 5905 stratum                        */
     uint8_t   li;            /* RFC 5905 leap indicator                 */
     uint32_t  root_disp_us;  /* Root Dispersion（微秒）                 */
@@ -65,7 +66,6 @@ void discipline_on_fix(uint8_t fix_quality, uint8_t sats);
 /* 取当前 UTC（整数运算，保留 µs）。未 anchored 返回 false。 */
 bool discipline_get_utc(uint64_t tb_us, uint32_t *sec, uint32_t *frac32);
 
-bool     discipline_locked(void);
 uint32_t discipline_ref_sec(void);      /* 参考时间戳（NTP 秒） */
 void     discipline_get_status(disc_status_t *st);
 

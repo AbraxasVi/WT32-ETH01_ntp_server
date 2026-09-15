@@ -16,10 +16,13 @@ extern "C" {
 #endif
 
 /* ========================== 以太网 / 网络 ==========================
- * IP 获取方式：DHCP 自动分配
+ * IP 获取方式：只支持 DHCP 自动分配（地址由路由器分配，换网段即插即用）。
+ * 说明：这里曾有一个 CFG_USE_DHCP 开关声称"0 = 静态 IP"，但
+ * ESP_NETIF_DEFAULT_ETH() 生成的 netif 自带 ESP_NETIF_DHCP_CLIENT 标志，
+ * 把它关掉既不会配置静态地址、也拦不住 dhcpc，属于死配置，已删除。
+ * 若确实需要静态地址：自行在 eth_if_init() 里 esp_netif_dhcpc_stop() +
+ * esp_netif_set_ip_info()，并把 sdkconfig 的 DHCP 相关选项一并考虑。
  * ------------------------------------------------------------------ */
-#define CFG_USE_DHCP           1
-
 #define CFG_NTP_PORT           123
 #define CFG_HTTP_PORT          80
 
@@ -101,10 +104,16 @@ extern "C" {
  * 先试 115200：高速率下 NMEA 突发最短，"RMC 跨秒"概率最低、授时最准；
  * 没收到任何有效语句再依次降速。多数模块出厂是 9600，探测几次就会命中。 */
 #define CFG_GPS_BAUD_LIST      { 115200, 57600, 38400, 19200, 9600 }
+/* 仅用于编译期一致性检查：实际遍历以数组长度为准（gps.c 的 GPS_BAUD_N）。
+ * 改波特率列表时必须同步改这里，否则 _Static_assert 直接编译失败。 */
 #define CFG_GPS_BAUD_COUNT     5
 /* 每个波特率的探测窗口（ms），需 > 一个 NMEA 周期。
  * 命中即提前退出，不会每次都等满窗口。 */
 #define CFG_GPS_BAUD_PROBE_MS  1500
+/* 运行中"多久没有新增合法语句"就重新走一遍波特率探测（秒）。
+ * 用于模块掉电重启（u-blox 回到出厂 9600）、被换过、或固件改了波特率
+ * 之后的自愈；0 = 关闭该自愈。 */
+#define CFG_GPS_RELOCK_SEC     15
 
 /* ======= 是否改写 GPS 模块自身的配置（默认全部关闭）=======
  * 【已按需求改为 0】很多 GNSS 模块是 ROM 只读版（或厂商固件屏蔽了 CFG 写入），
@@ -127,18 +136,25 @@ extern "C" {
 #define CFG_GPS_POLL_NAV_TIMEGPS   1
 #define CFG_GPS_LEAP_POLL_MS       5000
 
-/* UBX-CFG-TP5：1 Hz、UTC 网格、上升沿为秒首、脉宽 200 ms。
+/* 【生效条件】以下三项与 CFG_GPS_KEEP_GSV 都只在 CFG_GPS_SEND_UBX_CFG=1
+ * 且模块支持 CFG 写入时才会下发给模块。默认 0 = 一个字节都不发，改这些值
+ * 不会有任何效果（模块保持出厂配置），排障时先确认这一点。
+ *
+ * UBX-CFG-TP5：1 Hz、UTC 网格、上升沿为秒首、脉宽 200 ms。
  * 若发现 PPS 实际触发在下降沿（表现为恒定约 +200ms 偏差），
- * 把下面的 CFG_TP5_POLARITY_RISING 改成 0。 */
+ * 把下面的 CFG_TP5_POLARITY_RISING 改成 0（需先打开 CFG_GPS_SEND_UBX_CFG）。 */
 #define CFG_TP5_POLARITY_RISING    1
-/* 天线馈线延迟（ns），可按实际馈线长度标定：约 5 ns/m */
+/* 天线馈线延迟（ns），可按实际馈线长度标定：约 5 ns/m（同上，需开启下发） */
 #define CFG_TP5_ANT_CABLE_DELAY_NS 0
 /* PPS 高电平脉宽（µs）。M8N 出厂 100000；加宽便于示波器/LED 观察，
- * 对上升沿时刻没有影响。 */
+ * 对上升沿时刻没有影响（同上，需开启下发）。 */
 #define CFG_TP5_PULSE_LEN_US       200000
 
-/* 是否保留 GSV（可见卫星数）。关掉可显著缩短 NMEA 突发长度，
- * 降低“RMC 跨秒”概率；卫星数量改用 GGA 的“参与解算卫星数”。 */
+/* 是否保留 GSV（可见卫星数）。关掉可显著缩短 NMEA 突发长度，降低"RMC 跨秒"
+ * 概率；卫星数量改用 GGA 的"参与解算卫星数"。
+ * 【生效条件】本项通过 UBX-CFG-MSG 下发给模块，因此仅在 CFG_GPS_SEND_UBX_CFG=1
+ * （且模块支持 CFG 写入）时才真正关闭 GSV；默认配置下模块仍按出厂设置输出
+ * GSV，改这里没有效果。 */
 #define CFG_GPS_KEEP_GSV       0
 
 /* 判定“定位可用”的最小参与解算卫星数 */
@@ -179,15 +195,23 @@ extern "C" {
 
 /* ===================== NTP 并发 / 抗突发 =========================== */
 #define CFG_NTP_TASK_STACK     4096
-#define CFG_NTP_TASK_PRIO      19
+/* NTP 任务的优先级必须低于 lwIP tcpip 线程（CONFIG_LWIP_TCPIP_TASK_PRIO，
+ * 默认 18）：本任务靠 tcpip 线程把包投递到 socket，优先级反而更高会造成
+ * 优先级反转 —— 收到包后先唤醒 NTP 任务、tcpip 线程被推迟，突发时收包更慢、
+ * 抖动更大，正好伤害本项目最在意的指标。这里留 1 级余量。 */
+#define CFG_NTP_TASK_PRIO      (CONFIG_LWIP_TCPIP_TASK_PRIO - 1)
 /* SO_RCVBUF（字节），需要 CONFIG_LWIP_SO_RCVBUF=y */
 #define CFG_NTP_SO_RCVBUF      16384
 /* 令牌桶：整体限速，超出直接丢弃并计数，避免打爆 CPU */
 #define CFG_NTP_RATE_PPS       400    /* 平均包/秒 */
 #define CFG_NTP_RATE_BURST     800    /* 突发容量 */
 
-/* 以太网入站时戳环形缓冲深度（NTP 帧） */
-#define CFG_RX_TS_RING         8
+/* 以太网入站时戳环形缓冲深度（NTP 帧）。
+ * 每个入站 NTP 帧在驱动 hook 里入队一条时戳，消费侧严格按"每个包弹一条"
+ * 与之对齐，所以深度至少要覆盖 lwIP 的 UDP 接收队列
+ * （CONFIG_LWIP_UDP_RECVMBOX_SIZE）；太浅会在突发时挤出时戳（丢弃最旧），
+ * 表现为 rx_ts_miss 增长。必须是 2 的幂。 */
+#define CFG_RX_TS_RING         32
 
 /* ====================== 双核分工（ESP32 双核）======================
  * CORE_TIME(CPU0 = PRO)：PPS 硬件中断、时基伺服、GPS 串口/UART 中断与 NMEA 解析。

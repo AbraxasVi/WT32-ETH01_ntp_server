@@ -1,0 +1,34 @@
+# ESP-IDF 构建产物 / 生成文件
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+compile_commands.json
+
+# 临时构建检查目录（本项目调试时用过）
+.idf_build_check/
+.tmp/
+
+# 编辑器 / 工具
+.vscode/
+.idea/
+*.swp
+*.log
+.reasonix/
+.codex/
+.claude/
+.hermes/
+.joycode/
+.cursor/
+.windsurf/
+.aider*/
+.continue/
+.cline/
+.roo/
+.roo-code/
+.kiro/
+.gemini/
+.qwen/
+.copilot/
+.specstory/

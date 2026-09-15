@@ -155,10 +155,12 @@ static void eth_clock_enable(void)
 }
 
 /* ------------------------- PHY 自检 ---------------------------------
- * 读出 PHYID 并确认 SMI 通；顺带把 BMCR/BMSR 打出来方便排查地址插错。 */
+ * 读出 PHYID 并确认 SMI 通；顺带把 BMCR/BMSR 打出来方便排查地址插错。
+ * BMCR(0x00) 的 bit15=软复位、bit12=自协商使能、bit11=掉电；读回 0x0000 或
+ * 0xFFFF 基本可以断定 addr 选错（或 SMI 根本没通）。读操作无副作用。 */
 static void phy_diag(void)
 {
-    uint32_t id1 = 0, id2 = 0, bmsr = 0;
+    uint32_t id1 = 0, id2 = 0, bmsr = 0, bmcr = 0;
     esp_eth_phy_reg_rw_data_t rw;
     uint32_t v;
 
@@ -176,6 +178,12 @@ static void phy_diag(void)
     esp_eth_ioctl(s_handle, ETH_CMD_READ_PHY_REG, &rw);
     bmsr = v;
 
+    v = 0;
+    rw.reg_addr = 0;                                  /* BMCR */
+    rw.reg_value_p = &v;
+    esp_eth_ioctl(s_handle, ETH_CMD_READ_PHY_REG, &rw);
+    bmcr = v;
+
     if (e1 != ESP_OK || e2 != ESP_OK) {
         ESP_LOGE(TAG, "PHY 在 addr=%d 上无响应（SMI 读超时）。"
                       "请检查：IO%d 是否已拉高使能振荡器、"
@@ -183,12 +191,14 @@ static void phy_diag(void)
                  CFG_ETH_PHY_ADDR, CFG_ETH_OSC_EN_GPIO);
         return;
     }
-    ESP_LOGI(TAG, "PHY addr=%d PHYID=0x%04X%04X BMSR=0x%04X link=%s ane=%s",
+    ESP_LOGI(TAG, "PHY addr=%d PHYID=0x%04X%04X BMCR=0x%04X BMSR=0x%04X "
+                  "link=%s ane=%s ane_en=%s",
              CFG_ETH_PHY_ADDR,
              (unsigned)(id1 & 0xFFFFU), (unsigned)(id2 & 0xFFFFU),
-             (unsigned)bmsr,
+             (unsigned)bmcr, (unsigned)bmsr,
              (bmsr & (1U << 2)) ? "UP" : "DOWN",
-             (bmsr & (1U << 5)) ? "done" : "nogo");
+             (bmsr & (1U << 5)) ? "done" : "nogo",
+             (bmcr & (1U << 12)) ? "y" : "n");
 }
 
 /* ------------------------- 事件处理 -------------------------------- */
@@ -221,11 +231,9 @@ static void eth_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         case ETHERNET_EVENT_DISCONNECTED:
             s_link_up = false;
             s_down_since_s = (uint32_t)(tb_now_us() / 1000000ULL);
-#if CFG_USE_DHCP
             /* 停掉 DHCP，等下次 link UP 时重新走一遍 discover，
              * 避免换网段后仍抱着旧地址不放 */
             esp_netif_dhcpc_stop(s_netif);
-#endif
             ESP_LOGW(TAG, "ETH link DOWN");
             break;
         default:
@@ -294,10 +302,9 @@ void eth_if_init(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
                                                &ip_event_handler, NULL));
 
-    /* 6) IP 地址：交给 DHCP */
-#if CFG_USE_DHCP
+    /* 6) IP 地址：交给 DHCP。本工程只支持 DHCP —— ESP_NETIF_DEFAULT_ETH()
+     *    生成的 netif 自带 DHCP client，这里只是兜底确保它在跑。 */
     ensure_dhcp();
-#endif
 
     /* 7) 启动 */
     ESP_ERROR_CHECK(esp_eth_start(s_handle));
@@ -355,6 +362,17 @@ void eth_if_periodic(void)
 {
 #if CFG_ETH_RECOVER_SEC
     if (s_link_up) {
+        s_down_since_s = 0;          /* 链路正常：清掉计时基准 */
+        return;
+    }
+    /* 【关键】上电时网线就没插好的话，驱动内部的初始 link 状态本就是 down，
+     * 不会产生 DISCONNECTED 事件，s_down_since_s 会一直是 0 —— 于是这里
+     * 永远"认为"还没断满 CFG_ETH_RECOVER_SEC，重建 PHY 的逻辑永不触发。
+     * 因此把"首次观察到 link down"的时刻惰性记录下来。
+     * （s_down_since_s == 0 是本模块约定的"尚未记录"哨兵。） */
+    if (s_down_since_s == 0) {
+        uint32_t now_s = (uint32_t)(tb_now_us() / 1000000ULL);
+        s_down_since_s = (now_s != 0) ? now_s : 1u;
         return;
     }
     uint32_t down = eth_if_link_down_seconds();

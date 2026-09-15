@@ -15,7 +15,8 @@
 - **NMEA / PPS 自动配对**：内置“整秒滑移”自恢复，长失锁或初次对齐偏差后不会卡死在永不匹配死循环；支持 9600~115200 波特率下 RMC 跨秒、突发滞后等真实场景。
 - **GNSS 波特率自动探测**：优先 115200（突发最短、授时最准），收不到有效语句再依次降到 57600 → 38400 → 19200 → 9600；纯被动监听，不写模块。
 - **多源闰秒**：只读轮询 UBX-NAV-TIMEGPS 的 `leapS`，并与内置闰秒表交叉校验。
-- **完整 NTPv4 报文**：Stratum / Root Dispersion / Precision / Leap Indicator 全部按锁定状态动态填写；独立高优任务 + BSD socket + `SO_RCVBUF` + 令牌桶限速，抗突发查询。
+- **完整 NTPv4 报文**：Stratum / Root Dispersion / Precision / Leap Indicator 全部按锁定状态动态填写；独立任务 + BSD socket + `SO_RCVBUF` + 令牌桶限速，抗突发查询（任务优先级刻意低于 lwIP tcpip 线程，避免优先级反转）。
+- **抗反射 / 抗误用**：只响应 mode 3（标准客户端）；源地址属于 `0.0.0.0/8`、组播或保留网段的请求直接丢弃；尚未建立绝对时间基准时**静默不回包**（不会发出 transmit 时戳为 0 的非法响应，该计数显示为 `unsync`）。
 - **双核分工**：CPU0 = 时基 / PPS / GPS（时间敏感，独占）；CPU1 = 以太网 / lwIP / NTP / HTTP（与 lwIP tcpip 线程同核）。
 - **以太网健壮性**：DHCP 获取地址；自定义 input path 抓 NTP 入站帧到达时刻；断链超时强制重建 PHY，暴露 link UP 计数以观察是否仍在翻动。
 - **Web 监控面板**：实时显示锁定状态、相位误差、频率修正、卫星数、Holdover 等，并保留最近15 条 GNGGA / GNGSA / GNZDA 原始报文便于排障。
@@ -113,11 +114,11 @@ idf.py build
 
 | 宏                              | 默认   | 说明                                              |
 |---------------------------------|--------|---------------------------------------------------|
-| `CFG_USE_DHCP`                  | `1`    | 1=DHCP，0=静态 IP                                  |
 | `CFG_NTP_PORT` / `CFG_HTTP_PORT`| `123`/`80` | NTP 与 Web 端口                                |
 | `CFG_PPS_GPIO` / `CFG_PPS_EDGE` | `2`/上升沿 | PPS 输入脚与边沿                                |
 | `CFG_GPS_TX_GPIO` / `RX_GPIO`   | `17`/`5` | GPS 串口脚位                                     |
 | `CFG_GPS_BAUD_LIST`             | `115200,57600,38400,19200,9600` | 探测顺序（高→低）                     |
+| `CFG_GPS_RELOCK_SEC`            | `15`   | 多久没有合法语句就重探波特率（秒，0=关闭）         |
 | `CFG_GPS_SET_BAUD`              | `0`    | 是否用 UBX-CFG-PRT 改模块波特率（写）              |
 | `CFG_GPS_SEND_UBX_CFG`          | `0`    | 是否下发 UBX 配置（写）                            |
 | `CFG_GPS_POLL_NAV_TIMEGPS`      | `1`    | 只读轮询 UBX-NAV-TIMEGPS 取闰秒                    |
@@ -140,7 +141,7 @@ idf.py build
 - **锁定状态 / Stratum / Leap Indicator / Root Dispersion**
 - **相位误差（offset）**、**抖动（jitter）**、**频率修正（ppb）**
 - **PPS 计数 / 漏拍 / Holdover 时长**
-- **GNSS 卫星数（可见 / 参与解算）**、Fix Quality、HDOP、当前波特率
+- **GNSS 卫星数（参与解算 / 可见）**、Fix Quality、HDOP、当前波特率
 - **伺服事件计数**：step / resync / slip / mismatch / late（排障用，持续上涨说明对时链路有问题）
 - **最近 15 条原始报文**：GNGGA / GNGSA / GNZDA，便于核对定位与授时是否正常
 
@@ -175,7 +176,7 @@ chronyc sources -v
 下面是一台**已锁定**设备的真实样例（数值节选自实际运行日志）：
 
 ```
-I (3452314) mon: LINK UP 192.168.6.201 | UTC 2026-09-14 15:37:37 | LOCKED   stratum=1 li=0 | off=1us jit=9us ppb=5000 | hold=797ms pps=144840/0 | sats=11/7 fixq=1 hdop=2.5 [FIX] | baud=9600 | ntp req=1 resp=1 bad=0 drop=0 | rxTs 1/0 | linkup=1 | sv 1/1/2/1/0 | lag=658ms | heap=182KB
+I (48026284) mon: LINK UP 192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED  stratum=1 li=0 | off=0us jit=1us ppb=5004 | hold=956ms pps=189414/0 | sats=9/11 fixq=1 hdop=2.5 [FIX] | baud=9600 cfg=0 | ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0 | rxTs 8/0 | linkup=1 | sv 1/1/2/1/128 | lag=683ms | heap=217KB
 ```
 
 逐字段含义：
@@ -185,18 +186,20 @@ I (3452314) mon: LINK UP 192.168.6.201 | UTC 2026-09-14 15:37:37 | LOCKED   stra
 | `LINK UP 192.168.6.201` | 以太网链路状态与 IP（DHCP 获取） |
 | `UTC 2026-09-14 15:37:37` | 当前 UTC；未同步时显示 `未同步` |
 | `LOCKED stratum=1 li=0` | 锁定状态 / NTP 层级 / 闰秒指示符（LI） |
-| `off=1us jit=9us ppb=5000` | PPS 相位误差 / 抖动 / 频率修正（ppb） |
-| `hold=797ms pps=144840/0` | Holdover 时长（未见过 PPS 时为 `n/a(无PPS)`）/ PPS 累计与丢失 |
-| `sats=11/7 fixq=1 hdop=2.5 [FIX]` | 卫星（可见/参与解算）/ Fix Quality / HDOP / 定位可用 |
-| `baud=9600` | 当前 GNSS 波特率（自动探测结果） |
-| `ntp req=1 resp=1 bad=0 drop=0` | NTP 请求 / 应答 / 非法报文 / 被令牌桶丢弃 |
-| `rxTs 1/0` | 使用了驱动层入站硬件时戳的次数 / 回退到 socket 时刻的次数 |
+| `off=0us jit=1us ppb=5004` | PPS 相位误差 / 抖动 / 频率修正（ppb） |
+| `hold=956ms pps=189414/0` | Holdover 时长（未见过 PPS 时为 `n/a(无PPS)`）/ PPS 累计与丢失 |
+| `sats=9/11 fixq=1 hdop=2.5 [FIX]` | 卫星（**参与解算 / 可见**）/ Fix Quality / HDOP / 定位可用 |
+| `baud=9600 cfg=0` | 当前 GNSS 波特率（自动探测结果）/ 已下发的 UBX 配置条数（默认配置下恒为 0） |
+| `ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0` | NTP 请求 / 应答 / **未同步未应答** / 非法报文 / 被令牌桶丢弃 / 发送失败 |
+| `rxTs 8/0` | 使用了驱动层入站硬件时戳的次数 / 回退到 socket 时刻的次数 |
 | `linkup=1` | 累计 link UP 次数（持续上涨说明链路仍在翻动） |
-| `sv 1/1/2/1/0` | 伺服事件：阶跃 / 重对齐(RMC) / 整秒滑移 / RMC 失配 / 传输跨秒 |
-| `lag=658ms` | NMEA 语句起始相对其 PPS 边沿的滞后 |
-| `heap=182KB` | 空闲堆内存 |
+| `sv 1/1/2/1/128` | 伺服事件：阶跃 / 重对齐(RMC) / 整秒滑移 / RMC 失配 / 传输跨秒 |
+| `lag=683ms` | NMEA 语句起始相对其 PPS 边沿的滞后 |
+| `heap=217KB` | 空闲堆内存 |
 
-> 说明：上述 `off=1us`、`ppb=5000`、相位抖动 `jit=9us`、PPS 稳定累计说明设备已处于健康锁定状态，授时精度在微秒级。不同构建版本末尾字段可能略有差异（如是否打印堆）。
+> 说明：上述 `off=0us`、`ppb=5004`、相位抖动 `jit=1us`、PPS 稳定累计说明设备已处于健康锁定状态，授时精度在微秒级。
+> `unsync` 是"尚未建立绝对时间基准、按 RFC 5905 不回包"的请求数（锁定后应恒为 0，只在冷启动未对齐期间增长）；
+> `sv` 最后一位（`late`）在 9600 波特下缓慢增长属常态 —— 那是 NMEA 突发跨秒时的正常配对回退，不是故障。
 
 客户机实测，精度还行
 
@@ -217,9 +220,10 @@ I (3452314) mon: LINK UP 192.168.6.201 | UTC 2026-09-14 15:37:37 | LOCKED   stra
 ## 排障小贴士
 
 - **link 反复 UP/DOWN**：确认 IO16 已拉高（振荡器使能）、`EMAC_CLK_EXT_IN` 已选、 `reset_gpio_num = -1`（PHY nRST 未接 GPIO）。
-- **相位误差恒为 ~+200 ms**：说明 PPS 实际在下降沿触发，把 `config.h` 的 `CFG_TP5_POLARITY_RISING` 改为 `0`。
-- **RMC 与 PPS 一直对不上**：检查 GNSS 波特率是否被识别（`baud_locked`）、 GSV 是否过长导致跨秒（可关 `CFG_GPS_KEEP_GSV`），以及定位是否达标
+- **相位误差恒为 ~+200 ms**：说明 PPS 实际在下降沿触发。把 `config.h` 的 `CFG_TP5_POLARITY_RISING` 改为 `0` —— **注意这需要 `CFG_GPS_SEND_UBX_CFG=1` 且模块支持 CFG 写入**；默认 0 时该值根本不会下发，改了也没有效果（见 `config.h` 里的生效条件说明）。
+- **RMC 与 PPS 一直对不上**：检查 GNSS 波特率是否被识别（`baud_locked`）、 GSV 是否过长导致跨秒（关 `CFG_GPS_KEEP_GSV`，同样**仅在 `CFG_GPS_SEND_UBX_CFG=1` 时生效**），以及定位是否达标
   （`sats_used >= CFG_GPS_MIN_SATS`）。
+- **串口偶发 `N 秒未收到合法 NMEA，重新探测波特率`**：这是模块掉电重启 / 被换 / 波特率被改之后的自愈动作（`CFG_GPS_RELOCK_SEC`，默认 15 s）。探测是只读的、失败会恢复原波特率；嫌频繁可调大该值，设 0 关闭。
 - **HTTP 页面读取失败**：查看 `/status.json` 是否为合法 JSON，先用串口日志确认服务已起。
 
 ---
@@ -273,8 +277,12 @@ with a built-in real-time Web monitoring panel.
 - **Multi-source leap second**: polls UBX-NAV-TIMEGPS `leapS` read-only and cross-checks it
   against a built-in leap-second table.
 - **Full NTPv4 (RFC 5905)**: Stratum / Root Dispersion / Precision / Leap Indicator are filled
-  dynamically from the lock state; a dedicated high-priority task + BSD socket + `SO_RCVBUF` +
-  token-bucket rate limiting absorb burst queries.
+  dynamically from the lock state; a dedicated task + BSD socket + `SO_RCVBUF` + token-bucket rate
+  limiting absorb burst queries (its priority is deliberately kept below the lwIP tcpip thread to
+  avoid priority inversion).
+- **Anti-reflection / misuse hardening**: answers mode 3 (standard clients) only; drops requests from
+  `0.0.0.0/8`, multicast and reserved source ranges; stays **silent until an absolute time base
+  exists** (never emits a response with a zero transmit timestamp — counted as `unsync`).
 - **Dual-core split**: CPU0 = time base / PPS / GPS (time-sensitive, exclusive); CPU1 = Ethernet
   / lwIP / NTP / HTTP (same core as the lwIP tcpip thread).
 - **Ethernet robustness**: DHCP address; custom input path captures the NTP inbound frame
@@ -383,11 +391,11 @@ Most behavior can be tuned in `config.h` without touching logic:
 
 | Macro                          | Default | Description                                    |
 |--------------------------------|---------|------------------------------------------------|
-| `CFG_USE_DHCP`                 | `1`     | 1=DHCP, 0=static IP                            |
 | `CFG_NTP_PORT` / `CFG_HTTP_PORT` | `123`/`80` | NTP and Web ports                        |
 | `CFG_PPS_GPIO` / `CFG_PPS_EDGE` | `2`/rising | PPS input pin and edge                      |
 | `CFG_GPS_TX_GPIO` / `RX_GPIO`  | `17`/`5` | GPS UART pins                                |
 | `CFG_GPS_BAUD_LIST`            | `115200,57600,38400,19200,9600` | Probe order (high→low)        |
+| `CFG_GPS_RELOCK_SEC`           | `15`    | Re-probe baud after N s with no valid sentence (0=off) |
 | `CFG_GPS_SET_BAUD`             | `0`     | Write module baud via UBX-CFG-PRT (write)      |
 | `CFG_GPS_SEND_UBX_CFG`         | `0`     | Send UBX config (write)                        |
 | `CFG_GPS_POLL_NAV_TIMEGPS`     | `1`     | Read-only poll UBX-NAV-TIMEGPS for leap second |
@@ -410,7 +418,7 @@ every 2 seconds and shows:
 - **Lock state / Stratum / Leap Indicator / Root Dispersion**
 - **Phase error (offset)**, **jitter**, **frequency correction (ppb)**
 - **PPS count / missed / Holdover duration**
-- **GNSS satellites (visible / in-solution)**, Fix Quality, HDOP, current baud rate
+- **GNSS satellites (in-solution / visible)**, Fix Quality, HDOP, current baud rate
 - **Servo event counters**: step / resync / slip / mismatch / late (for troubleshooting; a steadily
   rising value means the timing link has a problem)
 - **Last 15 raw sentences**: GNGGA / GNGSA / GNZDA, to verify fix and timing
@@ -444,7 +452,7 @@ chronyc sources -v
 `monitor.c`. Below is a **locked** device's real output (values excerpted from an actual run):
 
 ```
-I (3452314) mon: LINK UP 192.168.6.201 | UTC 2026-09-14 15:37:37 | LOCKED   stratum=1 li=0 | off=1us jit=9us ppb=5000 | hold=797ms pps=144840/0 | sats=11/7 fixq=1 hdop=2.5 [FIX] | baud=9600 | ntp req=1 resp=1 bad=0 drop=0 | rxTs 1/0 | linkup=1 | sv 1/1/2/1/0 | lag=658ms | heap=182KB
+I (48026284) mon: LINK UP 192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED  stratum=1 li=0 | off=0us jit=1us ppb=5004 | hold=956ms pps=189414/0 | sats=9/11 fixq=1 hdop=2.5 [FIX] | baud=9600 cfg=0 | ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0 | rxTs 8/0 | linkup=1 | sv 1/1/2/1/128 | lag=683ms | heap=217KB
 ```
 
 Field-by-field meaning:
@@ -454,20 +462,22 @@ Field-by-field meaning:
 | `LINK UP 192.168.6.201` | Ethernet link state and IP (DHCP) |
 | `UTC 2026-09-14 15:37:37` | Current UTC; shows `未同步` (unsynchronized) when not anchored |
 | `LOCKED stratum=1 li=0` | Lock state / NTP stratum / Leap Indicator (LI) |
-| `off=1us jit=9us ppb=5000` | PPS phase error / jitter / frequency correction (ppb) |
-| `hold=797ms pps=144840/0` | Holdover duration (`n/a(无PPS)` if PPS never seen) / PPS total and missed |
-| `sats=11/7 fixq=1 hdop=2.5 [FIX]` | Satellites (visible/in-solution) / Fix Quality / HDOP / fix valid |
-| `baud=9600` | Current GNSS baud rate (auto-detected) |
-| `ntp req=1 resp=1 bad=0 drop=0` | NTP requests / responses / invalid / dropped by token bucket |
-| `rxTs 1/0` | Times the driver-layer inbound hardware timestamp was used / fell back to socket time |
+| `off=0us jit=1us ppb=5004` | PPS phase error / jitter / frequency correction (ppb) |
+| `hold=956ms pps=189414/0` | Holdover duration (`n/a(无PPS)` if PPS never seen) / PPS total and missed |
+| `sats=9/11 fixq=1 hdop=2.5 [FIX]` | Satellites (**in-solution / visible**) / Fix Quality / HDOP / fix valid |
+| `baud=9600 cfg=0` | Current GNSS baud rate (auto-detected) / UBX config messages sent (always 0 with defaults) |
+| `ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0` | NTP requests / responses / **valid but not answered (no time base yet)** / invalid / dropped by token bucket / send failures |
+| `rxTs 8/0` | Times the driver-layer inbound hardware timestamp was used / fell back to socket time |
 | `linkup=1` | Cumulative link-UP count (keeps rising if the link is still flapping) |
-| `sv 1/1/2/1/0` | Servo events: step / resync (RMC) / integer-second slip / RMC mismatch / cross-second |
-| `lag=658ms` | Lag of the NMEA sentence start relative to its PPS edge |
-| `heap=182KB` | Free heap memory |
+| `sv 1/1/2/1/128` | Servo events: step / resync (RMC) / integer-second slip / RMC mismatch / cross-second |
+| `lag=683ms` | Lag of the NMEA sentence start relative to its PPS edge |
+| `heap=217KB` | Free heap memory |
 
-> Note: `off=1us`, `ppb=5000`, jitter `jit=9us`, and steadily accumulating PPS show the device is
-> in a healthy locked state with microsecond-level accuracy. The trailing field may differ slightly
-> across builds (e.g. whether heap is printed).
+> Note: `off=0us`, `ppb=5004`, jitter `jit=1us`, and steadily accumulating PPS show the device is
+> in a healthy locked state with microsecond-level accuracy. `unsync` counts valid requests that were
+> not answered because no absolute time base had been established yet (stays 0 once locked); the last
+> `sv` value (`late`) growing slowly at 9600 baud is normal — it is the pairing fallback when an NMEA
+> burst crosses a second boundary.
 
 ---
 
@@ -475,11 +485,16 @@ Field-by-field meaning:
 
 - **Link keeps flapping UP/DOWN**: confirm IO16 is pulled high (oscillator enable),
   `EMAC_CLK_EXT_IN` is selected, and `reset_gpio_num = -1` (PHY nRST not wired to GPIO).
-- **Phase error stuck at ~+200 ms**: the PPS actually fires on the falling edge; change
-  `CFG_TP5_POLARITY_RISING` to `0` in `config.h`.
+- **Phase error stuck at ~+200 ms**: the PPS actually fires on the falling edge. Set
+  `CFG_TP5_POLARITY_RISING` to `0` in `config.h` — **this only takes effect when
+  `CFG_GPS_SEND_UBX_CFG=1` and the module accepts CFG writes**; with the default 0 the value is
+  never sent to the module at all.
 - **RMC never matches PPS**: check the GNSS baud was detected (`baud_locked`), whether GSV is too
-  long and causes cross-second (turn off `CFG_GPS_KEEP_GSV`), and whether the fix qualifies
-  (`sats_used >= CFG_GPS_MIN_SATS`).
+  long and causes cross-second (turn off `CFG_GPS_KEEP_GSV`, which likewise **requires
+  `CFG_GPS_SEND_UBX_CFG=1`**), and whether the fix qualifies (`sats_used >= CFG_GPS_MIN_SATS`).
+- **Occasional `N 秒未收到合法 NMEA，重新探测波特率` in the log**: that is the self-healing path
+  (`CFG_GPS_RELOCK_SEC`, default 15 s) triggered when the module was power-cycled / swapped or its
+  baud rate changed. Probing is read-only and restores the previous baud rate on failure.
 - **HTTP page fails to load**: check whether `/status.json` is valid JSON; first confirm the service
   started via the serial log.
 

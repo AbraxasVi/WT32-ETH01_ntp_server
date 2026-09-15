@@ -89,7 +89,9 @@ static int build_json(char *buf, size_t cap)
     uint32_t sec = 0, frac = 0;
     static char lines[GPS_RAW_LINES][GPS_RAW_LINE_LEN];   /* ~1.9KB，放静态避免压 http 栈 */
     int raw_cnt, p;
-    /* 预留 8 字节给收尾的 "]}"，保证无论内容多长输出的都是合法 JSON */
+    /* 预留 8 字节给收尾的 "]}"
+     * （这只是保证"不会越界写"：真正溢出时前面的字段已被截断，输出就不是
+     *   合法 JSON 了 —— 那种情况由末尾的 truncated 分支换成错误对象）。 */
     size_t lim = (cap > 16u) ? (cap - 8u) : cap;
 
     discipline_get_status(&d);
@@ -116,9 +118,10 @@ static int build_json(char *buf, size_t cap)
         "\"fix_valid\":%s,\"fix_quality\":%u,\"sats_used\":%u,\"sats_view\":%u,"
         "\"hdop\":%u.%u,"
         "\"leap_s\":%d,\"leap_expected\":%d,\"leap_ok\":%s,"
-        "\"nmea\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,"
+        "\"nmea\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"ubx_cfg\":%lu,"
         "\"holdover_valid\":%s,"
-        "\"ntp_req\":%lu,\"ntp_resp\":%lu,\"ntp_bad\":%lu,\"ntp_drop\":%lu,"
+        "\"ntp_req\":%lu,\"ntp_resp\":%lu,\"ntp_unsync\":%lu,"
+        "\"ntp_bad\":%lu,\"ntp_drop\":%lu,\"ntp_txfail\":%lu,"
         "\"rx_ts_used\":%lu,\"rx_ts_miss\":%lu,"
         "\"step\":%lu,\"resync\":%lu,\"slip\":%lu,\"mismatch\":%lu,\"late\":%lu,"
         "\"lag_ms\":%lu,"
@@ -140,9 +143,11 @@ static int build_json(char *buf, size_t cap)
         (unsigned)(g.hdop_x10 / 10), (unsigned)(g.hdop_x10 % 10),
         (int)g.leap_s, (int)g.leap_expected, g.leap_mismatch ? "false" : "true",
         (unsigned long)g.nmea_count, (unsigned long)g.ubx_ack, (unsigned long)g.ubx_nak,
+        (unsigned long)g.cfg_sent,
         d.holdover_valid ? "true" : "false",
         (unsigned long)n.requests, (unsigned long)n.responses,
-        (unsigned long)n.bad, (unsigned long)n.dropped,
+        (unsigned long)n.unsynced,
+        (unsigned long)n.bad, (unsigned long)n.dropped, (unsigned long)n.send_fail,
         (unsigned long)n.rx_ts_used, (unsigned long)n.rx_ts_miss,
         (unsigned long)d.step_count, (unsigned long)d.resync_count,
         (unsigned long)d.slip_count, (unsigned long)d.mismatch_count,
@@ -164,7 +169,17 @@ static int build_json(char *buf, size_t cap)
         out++;
     }
     /* 收尾用完整 cap，保证 "]}"" 一定有地方写 */
+    bool truncated = ((size_t)p >= lim);
     p = json_append(buf, cap, p, "]}");
+
+    if (truncated) {
+        /* 字段总量超出缓冲：给一个明确的错误对象，而不是半截 JSON ——
+         * 半截 JSON 会让前端 JSON.parse 直接抛错、页面停在 loading，
+         * 排查时分不清是"字段太多"还是"服务没起来"。 */
+        int n = snprintf(buf, cap, "{\"error\":\"status buffer overflow\",\"cap\":%u}",
+                         (unsigned)cap);
+        return (n > 0) ? n : 0;
+    }
 
     if (p < 0) {
         p = 0;
@@ -225,13 +240,15 @@ static const char *PAGE_HEAD =
     "   ['PPS 相位误差',d.offset_us,'us'],"
     "   ['抖动',d.jitter_us,'us'],"
     "   ['频率修正',d.ppb,'ppb'],"
-    "   ['守时',d.holdover_ms,'ms'],"
+    "   ['守时',d.holdover_valid?d.holdover_ms+' ms':'n/a(无PPS)',''],"
     "   ['卫星(解算/可见)',d.sats_used+'/'+d.sats_view,''],"
     "   ['Fix Quality',d.fix_quality,''],"
     "   ['HDOP',d.hdop,''],"
     "   ['波特率',d.baud,''],"
     "   ['NTP 请求',d.ntp_req,''],"
     "   ['NTP 丢弃',d.ntp_drop,''],"
+    "   ['NTP 未同步丢弃',d.ntp_unsync,''],"
+    "   ['NTP 发送失败',d.ntp_txfail,''],"
     "   ['入站硬件时戳',d.rx_ts_used,''],"
     "   ['闰秒(模块/期望)',d.leap_s+' / '+d.leap_expected,'']"
     "  ];"
@@ -240,7 +257,8 @@ static const char *PAGE_HEAD =
     "<div class=\"v ${cls(v)}\">${F(v,u)}</div></div>`).join('');"
     "  const rows=[['IP',d.ip],['Link',d.link?'UP':'DOWN'],['Precision',d.precision],"
     "   ['Root Dispersion',d.root_disp_us+' us'],['PPS 累计/丢失',d.pps_total+' / '+d.pps_missed],"
-    "   ['NMEA 语句',d.nmea],['UBX ACK/NAK',d.ubx_ack+' / '+d.ubx_nak],"
+    "   ['NMEA 语句',d.nmea],"
+    "   ['UBX ACK/NAK/已下发配置',d.ubx_ack+' / '+d.ubx_nak+' / '+d.ubx_cfg],"
     "   ['NTP 响应/非法',d.ntp_resp+' / '+d.ntp_bad],"
     "   ['伺服 阶跃/重对齐',d.step+' / '+d.resync],"
     "   ['伺服 整秒滑移/失配',d.slip+' / '+d.mismatch],"
@@ -281,11 +299,13 @@ static esp_err_t json_handler(httpd_req_t *req)
     }
     n = build_json(json, sizeof(json));
     httpd_resp_set_type(req, "application/json");
-    n = httpd_resp_send(req, json, n);
+    /* httpd_resp_send 返回的是 httpd 自己的错误码空间，别当成 esp_err_t 往外扔
+     * （上层会拿去调 esp_err_to_name，打印出无意义的名字）。 */
+    (void)httpd_resp_send(req, json, n);
     if (s_json_mux) {
         xSemaphoreGive(s_json_mux);
     }
-    return (esp_err_t)n;
+    return ESP_OK;
 }
 
 /* 浏览器会自动请求 favicon，没有 404 噪声 */
@@ -351,8 +371,8 @@ static void log_diag(void)
 
     ESP_LOGI(TAG,
              "%s %s | UTC %s | %s stratum=%u li=%u | off=%lldus jit=%lldus ppb=%ld | "
-             "hold=%s pps=%lu/%lu | sats=%u/%u fixq=%u hdop=%u.%u %s | baud=%lu | "
-             "ntp req=%lu resp=%lu bad=%lu drop=%lu | rxTs %lu/%lu | linkup=%lu | "
+             "hold=%s pps=%lu/%lu | sats=%u/%u fixq=%u hdop=%u.%u %s | baud=%lu cfg=%lu | "
+             "ntp req=%lu resp=%lu unsync=%lu bad=%lu drop=%lu txfail=%lu | rxTs %lu/%lu | linkup=%lu | "
              "sv %lu/%lu/%lu/%lu/%lu | lag=%lums | heap=%luKB",
              eth_if_link_up() ? "LINK UP " : "LINK DOWN", ip, utc,
              d.locked ? "LOCKED  " : "UNLOCKED", (unsigned)d.stratum, (unsigned)d.li,
@@ -361,9 +381,10 @@ static void log_diag(void)
              (unsigned)g.sats_used, (unsigned)g.sats_view, (unsigned)g.fix_quality,
              (unsigned)(g.hdop_x10 / 10), (unsigned)(g.hdop_x10 % 10),
              g.fix_valid ? "[FIX]" : "[NOFIX]",
-             (unsigned long)g.baud,
+             (unsigned long)g.baud, (unsigned long)g.cfg_sent,
              (unsigned long)n.requests, (unsigned long)n.responses,
-             (unsigned long)n.bad, (unsigned long)n.dropped,
+             (unsigned long)n.unsynced, (unsigned long)n.bad, (unsigned long)n.dropped,
+             (unsigned long)n.send_fail,
              (unsigned long)n.rx_ts_used, (unsigned long)n.rx_ts_miss,
              (unsigned long)eth_if_link_up_count(),
              /* 阶跃 / 重对齐 / 整秒滑移 / 失配 / 传输跨秒 */
@@ -402,6 +423,8 @@ void monitor_start(void)
         s_json_mux = xSemaphoreCreateMutex();
     }
     /* HTTP / 诊断属于网络侧，固定到 CORE_NET，不打扰时间核 */
-    xTaskCreatePinnedToCore(monitor_task, "monitor", CFG_MONITOR_STACK, NULL,
-                            CFG_MONITOR_PRIO, NULL, CFG_CORE_NET);
+    if (xTaskCreatePinnedToCore(monitor_task, "monitor", CFG_MONITOR_STACK, NULL,
+                                CFG_MONITOR_PRIO, NULL, CFG_CORE_NET) != pdPASS) {
+        ESP_LOGE(TAG, "monitor 任务创建失败（内存不足？），Web 面板不可用");
+    }
 }
