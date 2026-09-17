@@ -3,6 +3,8 @@
  *  - 9600 ~ 115200 波特率自动识别（被动探测，不改模块）
  *  - 串口长时间没有合法语句时自动重探波特率（CFG_GPS_RELOCK_SEC），
  *    用于模块掉电重启 / 被换 / 固件改了波特率之后的无人值守自愈
+ *  - 多 Hz 模块（5/10/25 Hz）：只采纳"NMEA 时间戳为整数秒"的那一整段报文用于
+ *    与 PPS 对齐，同一秒内的其余各段直接丢弃（见 gps.c 的 s_burst_keep）
  *  - 默认不向模块写入任何配置（CFG_GPS_SET_BAUD=0 / CFG_GPS_SEND_UBX_CFG=0），
  *    兼容 ROM 只读、厂商屏蔽 CFG 写入的模块
  *  - 解析 RMC(UTC 秒) / GGA(Fix Quality + 参与解算卫星数) / GSV(可见卫星数)
@@ -30,7 +32,18 @@ typedef struct {
     uint8_t  sats_used;       /* GGA field7: 参与解算卫星数   */
     uint8_t  sats_view;       /* GSV field3: 可见卫星数       */
     uint16_t hdop_x10;        /* GGA field8: HDOP * 10        */
-    uint32_t nmea_count;      /* 累计解析出的合法 NMEA 语句   */
+    uint32_t nmea_count;      /* 累计采纳的 NMEA 语句（仅整数秒段）  */
+    uint32_t bad_count;       /* 校验失败 / 超长截断 / UBX 校验失败 ——
+                               * 持续增长说明串口在丢字节（带宽不足/信号差） */
+    /* ---- RMC 分解计数（排障用）----
+     * 识别到 / 成功用于对时 / 内容不可用 / 被整段筛选丢弃。
+     *  · seen 不涨        → 模块压根没输出 RMC（没有 RMC 就没有绝对秒，锁不上）
+     *  · seen 涨、ok 不涨 → 模块输出的 RMC 自身不可用（status='V'、字段残缺） */
+    uint32_t rmc_seen;
+    uint32_t rmc_ok;
+    uint32_t rmc_bad;
+    uint32_t rmc_drop;
+    uint32_t gga_ts_used;     /* RMC 失效期间改用 GGA 时间戳兜底供秒的次数 */
     uint32_t ubx_ack;         /* UBX ACK-ACK 计数             */
     uint32_t ubx_nak;         /* UBX ACK-NAK 计数             */
     uint32_t cfg_sent;        /* 已下发的 UBX 配置条数        */

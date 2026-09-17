@@ -118,7 +118,9 @@ static int build_json(char *buf, size_t cap)
         "\"fix_valid\":%s,\"fix_quality\":%u,\"sats_used\":%u,\"sats_view\":%u,"
         "\"hdop\":%u.%u,"
         "\"leap_s\":%d,\"leap_expected\":%d,\"leap_ok\":%s,"
-        "\"nmea\":%lu,\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"ubx_cfg\":%lu,"
+        "\"nmea\":%lu,\"nmea_bad\":%lu,"
+        "\"rmc_seen\":%lu,\"rmc_ok\":%lu,\"rmc_bad\":%lu,\"rmc_drop\":%lu,\"gga_ts\":%lu,"
+        "\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"ubx_cfg\":%lu,"
         "\"holdover_valid\":%s,"
         "\"ntp_req\":%lu,\"ntp_resp\":%lu,\"ntp_unsync\":%lu,"
         "\"ntp_bad\":%lu,\"ntp_drop\":%lu,\"ntp_txfail\":%lu,"
@@ -142,7 +144,11 @@ static int build_json(char *buf, size_t cap)
         (unsigned)g.sats_used, (unsigned)g.sats_view,
         (unsigned)(g.hdop_x10 / 10), (unsigned)(g.hdop_x10 % 10),
         (int)g.leap_s, (int)g.leap_expected, g.leap_mismatch ? "false" : "true",
-        (unsigned long)g.nmea_count, (unsigned long)g.ubx_ack, (unsigned long)g.ubx_nak,
+        (unsigned long)g.nmea_count, (unsigned long)g.bad_count,
+        (unsigned long)g.rmc_seen, (unsigned long)g.rmc_ok,
+        (unsigned long)g.rmc_bad, (unsigned long)g.rmc_drop,
+        (unsigned long)g.gga_ts_used,
+        (unsigned long)g.ubx_ack, (unsigned long)g.ubx_nak,
         (unsigned long)g.cfg_sent,
         d.holdover_valid ? "true" : "false",
         (unsigned long)n.requests, (unsigned long)n.responses,
@@ -257,7 +263,8 @@ static const char *PAGE_HEAD =
     "<div class=\"v ${cls(v)}\">${F(v,u)}</div></div>`).join('');"
     "  const rows=[['IP',d.ip],['Link',d.link?'UP':'DOWN'],['Precision',d.precision],"
     "   ['Root Dispersion',d.root_disp_us+' us'],['PPS 累计/丢失',d.pps_total+' / '+d.pps_missed],"
-    "   ['NMEA 语句',d.nmea],"
+    "   ['NMEA 语句/坏帧',d.nmea+' / '+d.nmea_bad],"
+    "   ['RMC 识别/对时/异常/丢弃',d.rmc_seen+' / '+d.rmc_ok+' / '+d.rmc_bad+' / '+d.rmc_drop],"
     "   ['UBX ACK/NAK/已下发配置',d.ubx_ack+' / '+d.ubx_nak+' / '+d.ubx_cfg],"
     "   ['NTP 响应/非法',d.ntp_resp+' / '+d.ntp_bad],"
     "   ['伺服 阶跃/重对齐',d.step+' / '+d.resync],"
@@ -371,7 +378,8 @@ static void log_diag(void)
 
     ESP_LOGI(TAG,
              "%s %s | UTC %s | %s stratum=%u li=%u | off=%lldus jit=%lldus ppb=%ld | "
-             "hold=%s pps=%lu/%lu | sats=%u/%u fixq=%u hdop=%u.%u %s | baud=%lu cfg=%lu | "
+             "hold=%s pps=%lu/%lu | sats=%u/%u fixq=%u hdop=%u.%u %s | "
+             "baud=%lu cfg=%lu nmea=%lu/%lu rmc=%lu/%lu/%lu/%lu gga=%lu | "
              "ntp req=%lu resp=%lu unsync=%lu bad=%lu drop=%lu txfail=%lu | rxTs %lu/%lu | linkup=%lu | "
              "sv %lu/%lu/%lu/%lu/%lu | lag=%lums | heap=%luKB",
              eth_if_link_up() ? "LINK UP " : "LINK DOWN", ip, utc,
@@ -382,6 +390,10 @@ static void log_diag(void)
              (unsigned)(g.hdop_x10 / 10), (unsigned)(g.hdop_x10 % 10),
              g.fix_valid ? "[FIX]" : "[NOFIX]",
              (unsigned long)g.baud, (unsigned long)g.cfg_sent,
+             (unsigned long)g.nmea_count, (unsigned long)g.bad_count,
+             (unsigned long)g.rmc_seen, (unsigned long)g.rmc_ok,
+             (unsigned long)g.rmc_bad, (unsigned long)g.rmc_drop,
+             (unsigned long)g.gga_ts_used,
              (unsigned long)n.requests, (unsigned long)n.responses,
              (unsigned long)n.unsynced, (unsigned long)n.bad, (unsigned long)n.dropped,
              (unsigned long)n.send_fail,

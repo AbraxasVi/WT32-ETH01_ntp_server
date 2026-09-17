@@ -14,6 +14,7 @@
 - **Holdover 分级**：PPS 失锁后按时间自动降级 —— 锁定 → Stratum 2 →  Stratum 16 / LI=3（不同步），期间按最后估计频率自由运行，不丢秒。
 - **NMEA / PPS 自动配对**：内置“整秒滑移”自恢复，长失锁或初次对齐偏差后不会卡死在永不匹配死循环；支持 9600~115200 波特率下 RMC 跨秒、突发滞后等真实场景。
 - **GNSS 波特率自动探测**：优先 115200（突发最短、授时最准），收不到有效语句再依次降到 57600 → 38400 → 19200 → 9600；纯被动监听，不写模块。
+- **支持多 Hz 模块（5 / 10 / 25 Hz）**：只采纳 NMEA 时间戳为整数秒（`.00`）的那一整段报文与 PPS 对齐，同一秒内其余各段直接丢弃 —— 避免同一个整秒被反复投喂导致一直重对齐（表现为锁不上），也免去无谓的解析负担。
 - **多源闰秒**：只读轮询 UBX-NAV-TIMEGPS 的 `leapS`，并与内置闰秒表交叉校验。
 - **完整 NTPv4 报文**：Stratum / Root Dispersion / Precision / Leap Indicator 全部按锁定状态动态填写；独立任务 + BSD socket + `SO_RCVBUF` + 令牌桶限速，抗突发查询（任务优先级刻意低于 lwIP tcpip 线程，避免优先级反转）。
 - **抗反射 / 抗误用**：只响应 mode 3（标准客户端）；源地址属于 `0.0.0.0/8`、组播或保留网段的请求直接丢弃；尚未建立绝对时间基准时**静默不回包**（不会发出 transmit 时戳为 0 的非法响应，该计数显示为 `unsync`）。
@@ -176,7 +177,7 @@ chronyc sources -v
 下面是一台**已锁定**设备的真实样例（数值节选自实际运行日志）：
 
 ```
-I (48026284) mon: LINK UP 192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED  stratum=1 li=0 | off=0us jit=1us ppb=5004 | hold=956ms pps=189414/0 | sats=9/11 fixq=1 hdop=2.5 [FIX] | baud=9600 cfg=0 | ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0 | rxTs 8/0 | linkup=1 | sv 1/1/2/1/128 | lag=683ms | heap=217KB
+I (48026284) mon: LINK UP 192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED  stratum=1 li=0 | off=0us jit=1us ppb=5004 | hold=956ms pps=189414/0 | sats=9/11 fixq=1 hdop=2.5 [FIX] | baud=9600 cfg=0 nmea=12/0 | ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0 | rxTs 8/0 | linkup=1 | sv 1/1/2/1/128 | lag=683ms | heap=217KB
 ```
 
 逐字段含义：
@@ -189,7 +190,8 @@ I (48026284) mon: LINK UP 192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED  stra
 | `off=0us jit=1us ppb=5004` | PPS 相位误差 / 抖动 / 频率修正（ppb） |
 | `hold=956ms pps=189414/0` | Holdover 时长（未见过 PPS 时为 `n/a(无PPS)`）/ PPS 累计与丢失 |
 | `sats=9/11 fixq=1 hdop=2.5 [FIX]` | 卫星（**参与解算 / 可见**）/ Fix Quality / HDOP / 定位可用 |
-| `baud=9600 cfg=0` | 当前 GNSS 波特率（自动探测结果）/ 已下发的 UBX 配置条数（默认配置下恒为 0） |
+| `baud=115200 cfg=0 nmea=12/0` | 当前 GNSS 波特率（自动探测结果）/ 已下发的 UBX 配置条数（默认配置下恒为 0）/ **采纳的 NMEA 语句数 / 坏帧数**（坏帧持续增长 = 串口在丢字节，多半是带宽不足或信号差） |
+| `rmc=1/1/0/0 gga=0` | RMC 分项计数：**识别到 / 成功对时 / 内容不可用 / 被整段筛选丢弃**，以及 **`gga`＝RMC 失效期间改用 GGA 时间戳兜底供秒的次数**。`识别到`不涨 = 模块没输出 RMC（没有绝对秒，永远锁不上）；`识别到`涨但`对时`不涨 = 模块的 RMC 自身不可用（status='V' 或字段残缺）—— 此时固件会自动切到 GGA 兜底（看到 `gga` 增长即是在兜底），并每 10 s 打印一条 `RMC 被丢弃（原因）: 原文` 供定位 |
 | `ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0` | NTP 请求 / 应答 / **未同步未应答** / 非法报文 / 被令牌桶丢弃 / 发送失败 |
 | `rxTs 8/0` | 使用了驱动层入站硬件时戳的次数 / 回退到 socket 时刻的次数 |
 | `linkup=1` | 累计 link UP 次数（持续上涨说明链路仍在翻动） |
@@ -223,6 +225,7 @@ I (48026284) mon: LINK UP 192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED  stra
 - **相位误差恒为 ~+200 ms**：说明 PPS 实际在下降沿触发。把 `config.h` 的 `CFG_TP5_POLARITY_RISING` 改为 `0` —— **注意这需要 `CFG_GPS_SEND_UBX_CFG=1` 且模块支持 CFG 写入**；默认 0 时该值根本不会下发，改了也没有效果（见 `config.h` 里的生效条件说明）。
 - **RMC 与 PPS 一直对不上**：检查 GNSS 波特率是否被识别（`baud_locked`）、 GSV 是否过长导致跨秒（关 `CFG_GPS_KEEP_GSV`，同样**仅在 `CFG_GPS_SEND_UBX_CFG=1` 时生效**），以及定位是否达标
   （`sats_used >= CFG_GPS_MIN_SATS`）。
+- **接了 5 Hz / 10 Hz 模块后锁不上、或串口像"堵住"**：先看日志里的 `nmea=OK/BAD` 与 `baud=`。每秒只应采纳 1 组整数秒报文（约 10 条）；若 `OK` 每秒增长远少于这个数、而 `BAD` 持续增长，说明**串口物理带宽不够**（例：5 Hz 全语句 @ 9600 约 3 KB/s，而 9600 只有约 0.96 KB/s，必然丢字节），固件的整段筛选救不了 —— 需要把模块改到 115200，或用厂商工具 / UBX-CFG 把输出降到 1 Hz、裁掉 VTG/GSA/GLL/GSV。带宽足够时（例如 115200），整段筛选会正常完成对齐与锁定。
 - **串口偶发 `N 秒未收到合法 NMEA，重新探测波特率`**：这是模块掉电重启 / 被换 / 波特率被改之后的自愈动作（`CFG_GPS_RELOCK_SEC`，默认 15 s）。探测是只读的、失败会恢复原波特率；嫌频繁可调大该值，设 0 关闭。
 - **HTTP 页面读取失败**：查看 `/status.json` 是否为合法 JSON，先用串口日志确认服务已起。
 
@@ -274,6 +277,10 @@ with a built-in real-time Web monitoring panel.
 - **GNSS baud-rate auto-detection**: tries 115200 first (shortest burst, most accurate timing),
   then falls back to 57600 → 38400 → 19200 → 9600 if no valid sentence is seen; passive listening
   only, no writes to the module.
+- **Multi-rate GNSS support (5 / 10 / 25 Hz)**: only the burst whose NMEA timestamp is a whole
+  second (`.00`) is accepted and aligned to PPS; the other bursts of the same second are dropped —
+  otherwise the same whole second would be fed repeatedly (constant re-alignment, never locks) and
+  the parser would waste effort on sentences that can never be used.
 - **Multi-source leap second**: polls UBX-NAV-TIMEGPS `leapS` read-only and cross-checks it
   against a built-in leap-second table.
 - **Full NTPv4 (RFC 5905)**: Stratum / Root Dispersion / Precision / Leap Indicator are filled
@@ -452,7 +459,7 @@ chronyc sources -v
 `monitor.c`. Below is a **locked** device's real output (values excerpted from an actual run):
 
 ```
-I (48026284) mon: LINK UP 192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED  stratum=1 li=0 | off=0us jit=1us ppb=5004 | hold=956ms pps=189414/0 | sats=9/11 fixq=1 hdop=2.5 [FIX] | baud=9600 cfg=0 | ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0 | rxTs 8/0 | linkup=1 | sv 1/1/2/1/128 | lag=683ms | heap=217KB
+I (48026284) mon: LINK UP 192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED  stratum=1 li=0 | off=0us jit=1us ppb=5004 | hold=956ms pps=189414/0 | sats=9/11 fixq=1 hdop=2.5 [FIX] | baud=9600 cfg=0 nmea=12/0 | ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0 | rxTs 8/0 | linkup=1 | sv 1/1/2/1/128 | lag=683ms | heap=217KB
 ```
 
 Field-by-field meaning:
@@ -465,7 +472,8 @@ Field-by-field meaning:
 | `off=0us jit=1us ppb=5004` | PPS phase error / jitter / frequency correction (ppb) |
 | `hold=956ms pps=189414/0` | Holdover duration (`n/a(无PPS)` if PPS never seen) / PPS total and missed |
 | `sats=9/11 fixq=1 hdop=2.5 [FIX]` | Satellites (**in-solution / visible**) / Fix Quality / HDOP / fix valid |
-| `baud=9600 cfg=0` | Current GNSS baud rate (auto-detected) / UBX config messages sent (always 0 with defaults) |
+| `baud=115200 cfg=0 nmea=12/0` | Current GNSS baud rate (auto-detected) / UBX config messages sent (always 0 with defaults) / **accepted NMEA sentences / bad frames** (bad frames growing = dropped bytes: not enough bandwidth or a bad signal) |
+| `rmc=1/1/0/0 gga=0` | RMC breakdown: **seen / used for timing / unusable content / dropped by the whole-second filter**, plus **`gga` = times the GGA timestamp was used as a fallback while RMC was unusable**. `seen` flat = the module emits no RMC at all (no absolute second → it can never lock); `seen` rising but `used` flat = the RMC itself is unusable (status='V' or truncated fields) — the firmware then falls back to GGA automatically (watch `gga`) and logs one `RMC 被丢弃（reason）: <sentence>` every 10 s to pin down the cause |
 | `ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0` | NTP requests / responses / **valid but not answered (no time base yet)** / invalid / dropped by token bucket / send failures |
 | `rxTs 8/0` | Times the driver-layer inbound hardware timestamp was used / fell back to socket time |
 | `linkup=1` | Cumulative link-UP count (keeps rising if the link is still flapping) |
@@ -492,6 +500,13 @@ Field-by-field meaning:
 - **RMC never matches PPS**: check the GNSS baud was detected (`baud_locked`), whether GSV is too
   long and causes cross-second (turn off `CFG_GPS_KEEP_GSV`, which likewise **requires
   `CFG_GPS_SEND_UBX_CFG=1`**), and whether the fix qualifies (`sats_used >= CFG_GPS_MIN_SATS`).
+- **Won't lock with a 5 Hz / 10 Hz module, serial looks "clogged"**: check `nmea=OK/BAD` and `baud=`
+  in the log. Only one whole-second burst per second (~10 sentences) should be accepted; if `OK`
+  grows far slower than that while `BAD` keeps rising, the **serial link is physically saturated**
+  (e.g. 5 Hz with all sentences @ 9600 ≈ 3 KB/s against ~0.96 KB/s available) and no firmware filter
+  can help — switch the module to 115200, or reduce it to 1 Hz / drop VTG/GSA/GLL/GSV with the
+  vendor tool or UBX-CFG. With enough bandwidth (e.g. 115200) the whole-second filter aligns and
+  locks normally.
 - **Occasional `N 秒未收到合法 NMEA，重新探测波特率` in the log**: that is the self-healing path
   (`CFG_GPS_RELOCK_SEC`, default 15 s) triggered when the module was power-cycled / swapped or its
   baud rate changed. Probing is read-only and restores the previous baud rate on failure.

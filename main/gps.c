@@ -38,6 +38,30 @@ static bool         s_detect_hit = false;
 static bool         s_got_ack = false;
 static uint8_t      s_ack_cls = 0, s_ack_id = 0;
 
+/* ---- 多 Hz 模块的"整段筛选" ----
+ * 5/10/25 Hz 的模块每秒会吐出 N 组报文，其中只有 NMEA 时间戳小数部分为 0
+ * （.00）的那一组与 PPS 整秒对齐、可以用于授时。其余各组的 hhmmss.ss 会被
+ * 解析成同一个整秒，混进来只会让 RMC↔PPS 配对反复重对齐（表现为始终锁不上），
+ * 同时白白增加解析负担。
+ * 这里以每条 RMC 作为"段界标"：RMC 的时间戳小数不为 0 时，丢弃它以及紧随其
+ * 后的这一整段（GGA/GSA/GSV/GLL/VTG...），直到下一条 RMC。
+ * 1 Hz 模块的时间戳恒为 .00，因此行为与以前完全一致。
+ *
+ * 界标语句 = 带 hhmmss.ss 时间戳的 RMC 或 GGA，任一到达都重设本段标志。
+ * 两者都用是因为某些模块 RMC 输出稀疏（甚至完全不输出），只认 RMC 会让标志
+ * 停在旧值上把后续整批语句误丢（表现为 nmea 不再增长）。标志还带"保活"：
+ * 超过 1.5 s 没见到界标语句就取消筛选，绝不让它把数据流永久掐断。 */
+static bool         s_burst_keep = true;
+static uint64_t     s_burst_mark_us;    /* 最近一次界标语句的时刻（µs） */
+
+/* ---- 绝对秒的"日期记忆"+ GGA 兜底 ----
+ * RMC 是首选来源（既给秒又给日期）。但实测某些模块的整数秒 RMC 会整段不可用
+ * （status='V'、字段残缺），此时死等 RMC 就会一直掉锁。所以记住最近一次成功
+ * 解析的 RMC 日期：当 RMC 连续失效 > 3 s 时，改用"记住的日期 + GGA 的
+ * hhmmss"继续供秒，让时基不至于丢锁。 */
+static int          s_utc_y, s_utc_mo, s_utc_d;   /* 最近一次 RMC 给出的 UTC 日期 */
+static uint64_t     s_rmc_ok_tb;                  /* 最近一次 RMC 对时的时刻（µs） */
+
 /* ====================== 日期 / 闰秒工具 ============================ */
 static int is_leap(int y)
 {
@@ -203,11 +227,24 @@ static int split_fields(const char *line)
     if (cr) {
         *cr = 0;
     }
+    /* 【必须保留空字段】NMEA 语句里空字段很常见（静止时 RMC 的速度是 0.000
+     * 而航向为空：",0.000,,170926,"）。以前这里用 strtok()，它会把连续分隔符
+     * 当成一个并跳过空字段，于是其后所有字段索引整体前移 —— 结果把 date 当成了
+     * mode indicator，RMC 被误判为"时间/日期字段长度异常"而整段拒收（实测 5 Hz
+     * 模块静止时稳定踩中，表现为 rmc 的 ok 不再增长、反复掉锁）。
+     * 改成逐段扫描：每个逗号都切一刀，空段就是空字符串。 */
     int nf = 0;
-    char *p = strtok(s_fbuf, ",");
-    while (p && nf < 32) {
+    char *p = s_fbuf;
+    while (nf < 32) {
+        char *comma = strchr(p, ',');
+        if (comma) {
+            *comma = 0;
+        }
         s_f[nf++] = p;
-        p = strtok(NULL, ",");
+        if (!comma) {
+            break;
+        }
+        p = comma + 1;
     }
     return nf;
 }
@@ -229,30 +266,82 @@ static bool nmea_checksum_ok(const char *line)
     return c == (uint8_t)strtoul(chk, NULL, 16);
 }
 
+/* RMC / GGA 的第 2 个字段都是 "hhmmss.sss"。返回 false 表示不是整数秒
+ * （多 Hz 模块的 .20/.40/.60/.80 等）。不带小数部分时按整秒处理。
+ * 直接在字符串上找逗号/小数点，不必为每个句段都建字段表。 */
+static bool ts_is_whole_second(const char *line)
+{
+    const char *ts = strchr(line, ',');
+    if (!ts) {
+        return false;
+    }
+    ts++;
+    const char *end = strchr(ts, ',');
+    if (!end) {
+        return false;
+    }
+    const char *dot = memchr(ts, '.', (size_t)(end - ts));
+    if (!dot) {
+        return true;
+    }
+    for (const char *q = dot + 1; q < end; q++) {
+        if (*q != '0') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* 被丢弃的 RMC：计数 + 限流打印（每 10 s 最多一条），直接给出原因与原文。
+ * 否则"RMC 明明在流里、却始终锁不上"只能靠猜，而原因不同处置方向完全不同。 */
+static void rmc_reject(const char *why, const char *line)
+{
+    static uint64_t s_last_log_us;
+    uint64_t now = tb_now_us();
+
+    s_st.rmc_bad++;
+    if (now - s_last_log_us > 10000000ULL) {
+        s_last_log_us = now;
+        ESP_LOGW(TAG, "RMC 被丢弃（%s）: %s", why, line);
+    }
+}
+
+/* 解析 RMC 并交给时基做"整秒对齐"；成功时记住 UTC 日期供 GGA 兜底。 */
 static void parse_rmc(const char *line, uint64_t sentence_start_tb)
 {
     int nf = split_fields(line);
     if (nf < 10) {
+        rmc_reject("字段数不足", line);
         return;
     }
     if (strcmp(s_f[2], "A") != 0) {
-        return;                              /* 'V' = 定位无效 */
+        rmc_reject("status 不是 A（模块报告定位无效）", line);
+        return;
     }
     const char *t = s_f[1];
     const char *d = s_f[9];
     if (strlen(t) < 6 || strlen(d) != 6) {
+        rmc_reject("时间/日期字段长度异常", line);
         return;
     }
     int hh, mm, ss, DD, MO, YY;
     if (sscanf(t, "%2d%2d%2d", &hh, &mm, &ss) != 3) {
+        rmc_reject("时间字段解析失败", line);
         return;
     }
     if (sscanf(d, "%2d%2d%2d", &DD, &MO, &YY) != 3) {
+        rmc_reject("日期字段解析失败", line);
         return;
     }
     int y = (YY < 70) ? (2000 + YY) : (1900 + YY);
     uint32_t unix_sec = to_unix(y, MO, DD, hh, mm, ss);
     discipline_on_nmea_second(unix_sec, sentence_start_tb);
+    s_st.rmc_ok++;
+
+    s_utc_y     = y;
+    s_utc_mo    = MO;
+    s_utc_d     = DD;
+    s_rmc_ok_tb = tb_now_us();
 }
 
 static void parse_gga(const char *line)
@@ -273,6 +362,27 @@ static void parse_gga(const char *line)
     s_st.fix_valid   = (fq > 0 && s_st.sats_used >= CFG_GPS_MIN_SATS);
 
     discipline_on_fix(s_st.fix_quality, s_st.sats_used);
+
+    /* ---- 绝对秒兜底：RMC 失效时改用 GGA 的时间戳 ----
+     * 前提是曾经从 RMC 拿到过日期（s_rmc_ok_tb != 0）。
+     * 安全约束：只接受与当前钟面相差 ≤2 s 的推算值 —— 记住的日期可能已经过时
+     * （跨日），绝不允许用不可靠的日期去"重建"时间，只让它维持已建立的时基。 */
+    if (s_rmc_ok_tb != 0 && (tb_now_us() - s_rmc_ok_tb) > 3000000ULL) {
+        int hh, mm, ss;
+        if (strlen(s_f[1]) >= 6 && sscanf(s_f[1], "%2d%2d%2d", &hh, &mm, &ss) == 3) {
+            uint32_t sec = to_unix(s_utc_y, s_utc_mo, s_utc_d, hh, mm, ss);
+            uint32_t now_sec, now_frac;
+            if (discipline_get_utc(tb_now_us(), &now_sec, &now_frac) &&
+                (int64_t)sec - (int64_t)now_sec <= 2 &&
+                (int64_t)now_sec - (int64_t)sec <= 2) {
+                /* 这里用"当前时刻"近似语句起始：它只用来挑 PPS 边沿
+                 * （容差 CFG_NMEA_LAG_TOL_US = 400 ms），不参与相位测量，
+                 * 几十毫秒的近似足够，也省得为兜底路径再多传一个参数。 */
+                discipline_on_nmea_second(sec, tb_now_us());
+                s_st.gga_ts_used++;
+            }
+        }
+    }
 }
 
 static void parse_gsv(const char *line)
@@ -303,15 +413,38 @@ static void reset_parser(void)
 static void handle_nmea(const char *line)
 {
     if (!nmea_checksum_ok(line)) {
+        s_st.bad_count++;      /* 校验不过：多半是丢字节/截断（通道拥塞或信号差） */
         return;
     }
     /* 句子类型从第 3 个字符开始，短于 6 字节的畸形帧先挡掉：以前长度检查排在
      * raw_is_wanted() / strncmp() 之后，短句会先被按偏移读取（虽不越界，但读到
      * 的是 s_line 里的陈旧字节），判定结果不可信。 */
     if (strlen(line) < 6) {
+        s_st.bad_count++;
         return;
     }
+    /* 探测判据：只要收到校验正确的语句就算"有数据流"，必须放在整段筛选之前 ——
+     * 否则 5 Hz 模块在探测窗口内可能只碰上非整数秒段而误判为"没数据"。 */
     s_detect_hit = true;
+
+    /* ---- 多 Hz 模块：只保留整数秒那一整段（见 s_burst_keep 的说明） ---- */
+    bool is_rmc = (strncmp(line + 3, "RMC", 3) == 0);
+    if (is_rmc || strncmp(line + 3, "GGA", 3) == 0) {
+        s_burst_keep    = ts_is_whole_second(line);
+        s_burst_mark_us = tb_now_us();
+    } else if (!s_burst_keep && (tb_now_us() - s_burst_mark_us) > 1500000ULL) {
+        s_burst_keep = true;   /* 界标信号消失太久：取消筛选，避免把数据流掐断 */
+    }
+    if (is_rmc) {
+        s_st.rmc_seen++;
+    }
+    if (!s_burst_keep) {
+        if (is_rmc) {
+            s_st.rmc_drop++;
+        }
+        return;
+    }
+
     s_st.nmea_count++;
     if (raw_is_wanted(line)) {
         raw_store(line);
@@ -319,7 +452,7 @@ static void handle_nmea(const char *line)
     if (s_probe_mode) {
         return;
     }
-    if (strncmp(line + 3, "RMC", 3) == 0) {
+    if (is_rmc) {
         parse_rmc(line, s_sentence_start_tb);
     } else if (strncmp(line + 3, "GGA", 3) == 0) {
         parse_gga(line);
@@ -345,6 +478,7 @@ static void handle_ubx(const uint8_t *b, size_t len)
         c = (uint8_t)(c + a);
     }
     if (a != b[6 + plen] || c != b[7 + plen]) {
+        s_st.bad_count++;
         return;
     }
     s_detect_hit = true;
@@ -388,6 +522,7 @@ static void feed_byte(uint8_t c, uint64_t t_arrive)
             handle_nmea((const char *)s_line);
             reset_parser();
         } else if (s_pos >= sizeof(s_line) - 1) {
+            s_st.bad_count++;                  /* 单条语句超长被截断 */
             reset_parser();
         }
         break;
@@ -403,6 +538,7 @@ static void feed_byte(uint8_t c, uint64_t t_arrive)
         if (s_pos >= 6) {
             s_ubx_len = (uint16_t)(s_line[4] | ((uint16_t)s_line[5] << 8));
             if (s_ubx_len + 8u > sizeof(s_line)) {
+                s_st.bad_count++;
                 reset_parser();
                 break;
             }
