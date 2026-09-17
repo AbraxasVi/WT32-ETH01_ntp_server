@@ -81,6 +81,11 @@ extern "C" {
 #define CFG_NMEA_MATCH_US      400000
 #define CFG_NMEA_SNAP_US       50000
 #define CFG_NMEA_SLIP_TOL_US   100000
+/* 滑移的最大幅度（秒）：超过它就不认"滑移"，而是判定时间源不可信、丢弃本次对齐。
+ * 滑移是给"我们自己选错 ±1 秒边沿 / 失锁后晶振漂了整数秒"用的，不该无条件接受
+ * 任意整数秒 —— 实测模块丢定位后时间漂了 3 整秒，钟面就被拉走了 3 秒。
+ * 600 s 既挡得住"时间源完全乱掉"，又不会妨碍长时间失锁后的正常重新对齐。 */
+#define CFG_NMEA_SLIP_MAX_SEC  600
 
 /* NMEA 语句"开始发送"时刻相对其所属 PPS 边沿的滞后容差（µs）。
  * 模块在 PPS 之后才吐出该秒的 NMEA 突发，突发可能在 PPS 前一点就开始，
@@ -157,8 +162,16 @@ extern "C" {
  * GSV，改这里没有效果。 */
 #define CFG_GPS_KEEP_GSV       0
 
-/* 判定“定位可用”的最小参与解算卫星数 */
+/* 判定"定位可用"的最小参与解算卫星数 */
 #define CFG_GPS_MIN_SATS       4
+
+/* 判定"定位可用"的 GGA fix quality 允许范围。
+ * NMEA 定义：0=无效 1=SPS 2=DGPS 3=PPS 4=RTK固定 5=RTK浮动
+ *            6=推算(estimated) 7=手动 8=模拟
+ * 推算/模拟定位不具备授时资格（模块自己也会在 GLL 里用 'E' 标注），只认 1~5。
+ * 注意：gps.c 的 fix_valid 与 discipline.c 的定位判据共用这两个宏，改一处即可。 */
+#define CFG_GPS_FIXQ_MIN       1
+#define CFG_GPS_FIXQ_MAX       5
 
 /* ========================= 时基 / 伺服环 =========================== */
 /* 每拍 PPS 相位修正比例（1/x）：越小越平滑、收敛越慢 */

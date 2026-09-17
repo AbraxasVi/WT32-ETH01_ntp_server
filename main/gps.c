@@ -357,24 +357,29 @@ static void parse_gga(const char *line)
     s_st.fix_quality = (uint8_t)(fq < 0 ? 0 : (fq > 255 ? 255 : fq));
     s_st.sats_used   = (uint8_t)(sats < 0 ? 0 : (sats > 255 ? 255 : sats));
     s_st.hdop_x10    = (uint16_t)(hdop * 10.0f);
-    /* 与 discipline.c 的 s_fix_ok 用同一个条件（fq > 0 && sats >= CFG_GPS_MIN_SATS）：
-     * 本字段供面板/日志显示，那份用于 stratum/LI 判定。改判据时两处必须同步。 */
-    s_st.fix_valid   = (fq > 0 && s_st.sats_used >= CFG_GPS_MIN_SATS);
+    /* 与 discipline.c 的判据共用同一组宏：fix quality 必须落在
+     * [CFG_GPS_FIXQ_MIN, CFG_GPS_FIXQ_MAX]（默认 1~5，排除 6=推算、8=模拟）
+     * 且参与解算卫星数达标。本字段供面板/日志显示，那份用于 stratum/LI 判定
+     * —— 两处都引用宏，不会再出现"只改了一边"的偏差。 */
+    s_st.fix_valid   = (fq >= CFG_GPS_FIXQ_MIN && fq <= CFG_GPS_FIXQ_MAX &&
+                        s_st.sats_used >= CFG_GPS_MIN_SATS);
 
     discipline_on_fix(s_st.fix_quality, s_st.sats_used);
 
     /* ---- 绝对秒兜底：RMC 失效时改用 GGA 的时间戳 ----
-     * 前提是曾经从 RMC 拿到过日期（s_rmc_ok_tb != 0）。
-     * 安全约束：只接受与当前钟面相差 ≤2 s 的推算值 —— 记住的日期可能已经过时
-     * （跨日），绝不允许用不可靠的日期去"重建"时间，只让它维持已建立的时基。 */
-    if (s_rmc_ok_tb != 0 && (tb_now_us() - s_rmc_ok_tb) > 3000000ULL) {
+     * 前提：①曾经从 RMC 拿到过日期（s_rmc_ok_tb != 0）；②**当前定位合格**
+     * （模块自己都报 status='V'/fixq 不合格时，它的时间同样不可信，不该拿来对时）；
+     * ③与当前钟面相差 ≤1 s —— 记住的日期可能已跨日，绝不允许用不可靠的日期去
+     * "重建"时间，只让它维持已建立的时基。 */
+    if (s_rmc_ok_tb != 0 && s_st.fix_valid &&
+        (tb_now_us() - s_rmc_ok_tb) > 3000000ULL) {
         int hh, mm, ss;
         if (strlen(s_f[1]) >= 6 && sscanf(s_f[1], "%2d%2d%2d", &hh, &mm, &ss) == 3) {
             uint32_t sec = to_unix(s_utc_y, s_utc_mo, s_utc_d, hh, mm, ss);
             uint32_t now_sec, now_frac;
             if (discipline_get_utc(tb_now_us(), &now_sec, &now_frac) &&
-                (int64_t)sec - (int64_t)now_sec <= 2 &&
-                (int64_t)now_sec - (int64_t)sec <= 2) {
+                (int64_t)sec - (int64_t)now_sec <= 1 &&
+                (int64_t)now_sec - (int64_t)sec <= 1) {
                 /* 这里用"当前时刻"近似语句起始：它只用来挑 PPS 边沿
                  * （容差 CFG_NMEA_LAG_TOL_US = 400 ms），不参与相位测量，
                  * 几十毫秒的近似足够，也省得为兜底路径再多传一个参数。 */
@@ -385,6 +390,26 @@ static void parse_gga(const char *line)
     }
 }
 
+/* ---- 可见卫星数：按星座汇总 ----
+ * $GPGSV / $BDGSV（或 $GBGSV）/ $GAGSV / $GLGSV 各自上报的是"该星座的可见卫星
+ * 数"，直接覆盖只会留下最后一条 —— 多星座模块上就会出现 sats_used > sats_view
+ * 这种自相矛盾的显示（实测：GPS 10 颗 + 北斗 7 颗，面板却只显示 7）。
+ * 这里按 talker 分别记录，并且只累加"最近仍在输出"的星座：某星座消失后不再
+ * 发 GSV，它的旧值不能继续计入总数。 */
+static uint8_t  s_view_cnt[4];
+static uint64_t s_view_tb[4];
+#define GSV_KEEP_US  3000000ULL
+
+static int gsv_talker_slot(const char *line)
+{
+    if (line[1] == 'B' && line[2] == 'D') return 0;   /* 北斗 $BDGSV */
+    if (line[1] == 'G' && line[2] == 'B') return 0;   /* 北斗 $GBGSV */
+    if (line[1] == 'G' && line[2] == 'P') return 1;   /* GPS */
+    if (line[1] == 'G' && line[2] == 'A') return 2;   /* Galileo */
+    if (line[1] == 'G' && line[2] == 'L') return 3;   /* GLONASS */
+    return 1;                                         /* 合并输出的 $GNGSV 等归 GPS 槽 */
+}
+
 static void parse_gsv(const char *line)
 {
     int nf = split_fields(line);
@@ -392,7 +417,24 @@ static void parse_gsv(const char *line)
         return;
     }
     int view = atoi(s_f[3]);
-    s_st.sats_view = (uint8_t)(view < 0 ? 0 : (view > 255 ? 255 : view));
+    if (view < 0) {
+        view = 0;
+    } else if (view > 255) {
+        view = 255;
+    }
+
+    int k = gsv_talker_slot(line);
+    s_view_cnt[k] = (uint8_t)view;
+    s_view_tb[k]  = tb_now_us();
+
+    uint64_t now = tb_now_us();
+    uint32_t sum = 0;
+    for (int i = 0; i < 4; i++) {
+        if (now - s_view_tb[i] < GSV_KEEP_US) {
+            sum += s_view_cnt[i];
+        }
+    }
+    s_st.sats_view = (uint8_t)(sum > 255 ? 255 : sum);
 }
 
 /* ====================== 字节流状态机 =============================== */

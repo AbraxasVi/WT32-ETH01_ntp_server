@@ -317,12 +317,26 @@ void discipline_on_nmea_second(uint32_t unix_sec, uint64_t est_start_tb)
                 if (best_d < 0 && (best_d % 1000000LL) != 0) {
                     slip -= 1;                  /* C 整除向零取整，修正成向下取整 */
                 }
+                /* 幅度合理性检查：滑移是给"我们自己选错边沿 / 失锁后晶振漂了整数秒"
+                 * 用的，不该无条件接受任意整数秒。差得太多说明时间源本身不可信
+                 * （实测：模块丢定位后 RTC 漂了 3 整秒，钟面就被拉走了 3 秒），
+                 * 此时宁可丢弃本次对齐，也不能把钟面搬过去。 */
+                if (slip > (int64_t)CFG_NMEA_SLIP_MAX_SEC ||
+                    slip < -(int64_t)CFG_NMEA_SLIP_MAX_SEC) {
+                    s_cnt_mismatch++;
+                    portEXIT_CRITICAL(&s_lock);
+                    LOG_THROTTLE(10000, W,
+                                 "NMEA 与本地钟面相差 %lld 整秒，超出滑移上限 %d s，"
+                                 "判定时间源不可信，丢弃本次对齐",
+                                 (long long)slip, CFG_NMEA_SLIP_MAX_SEC);
+                    return;
+                }
                 reanchor_locked(p0, target);
                 s_cnt_slip++;
                 s_nmea_time_tb = tb_now_us();
                 s_ref_sec      = (uint32_t)(unix_sec + NTP_EPOCH_OFFSET);
                 portEXIT_CRITICAL(&s_lock);
-                LOG_THROTTLE(10000, W, "PPS 与 RMC 相差 %lld 整秒（滑移），已按 RMC 重新对齐",
+                LOG_THROTTLE(10000, W, "PPS 与 NMEA 相差 %lld 整秒（滑移），已按 NMEA 重新对齐",
                              (long long)slip);
                 return;
             }
@@ -365,7 +379,9 @@ void discipline_on_fix(uint8_t fix_quality, uint8_t sats)
     /* 见过 GGA 就置位：用于区分"模块根本不输出 GGA"和"输出但定位不合格"，
      * 前者不该把设备永久卡在 stratum 16（见 refresh_flags）。 */
     s_seen_gga = true;
-    if (fix_quality > 0 && sats >= CFG_GPS_MIN_SATS) {
+    /* 与 gps.c 的 fix_valid 共用同一组宏：推算(6)/模拟(8)定位不算合格来源 */
+    if (fix_quality >= CFG_GPS_FIXQ_MIN && fix_quality <= CFG_GPS_FIXQ_MAX &&
+        sats >= CFG_GPS_MIN_SATS) {
         s_fix_tb = now;
     }
     portEXIT_CRITICAL(&s_lock);

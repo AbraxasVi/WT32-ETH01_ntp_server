@@ -189,7 +189,7 @@ I (48026284) mon: LINK UP 192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED  stra
 | `LOCKED stratum=1 li=0` | 锁定状态 / NTP 层级 / 闰秒指示符（LI） |
 | `off=0us jit=1us ppb=5004` | PPS 相位误差 / 抖动 / 频率修正（ppb） |
 | `hold=956ms pps=189414/0` | Holdover 时长（未见过 PPS 时为 `n/a(无PPS)`）/ PPS 累计与丢失 |
-| `sats=9/11 fixq=1 hdop=2.5 [FIX]` | 卫星（**参与解算 / 可见**）/ Fix Quality / HDOP / 定位可用 |
+| `sats=9/11 fixq=1 hdop=2.5 [FIX]` | 卫星（**参与解算 / 多星座可见数之和**）/ Fix Quality / HDOP / 定位可用。`定位可用` 要求 fix quality ∈ [`CFG_GPS_FIXQ_MIN`, `CFG_GPS_FIXQ_MAX`]（默认 **1~5**，即排除 6=推算、8=模拟）**且**参与解算卫星数 ≥ `CFG_GPS_MIN_SATS` |
 | `baud=115200 cfg=0 nmea=12/0` | 当前 GNSS 波特率（自动探测结果）/ 已下发的 UBX 配置条数（默认配置下恒为 0）/ **采纳的 NMEA 语句数 / 坏帧数**（坏帧持续增长 = 串口在丢字节，多半是带宽不足或信号差） |
 | `rmc=1/1/0/0 gga=0` | RMC 分项计数：**识别到 / 成功对时 / 内容不可用 / 被整段筛选丢弃**，以及 **`gga`＝RMC 失效期间改用 GGA 时间戳兜底供秒的次数**。`识别到`不涨 = 模块没输出 RMC（没有绝对秒，永远锁不上）；`识别到`涨但`对时`不涨 = 模块的 RMC 自身不可用（status='V' 或字段残缺）—— 此时固件会自动切到 GGA 兜底（看到 `gga` 增长即是在兜底），并每 10 s 打印一条 `RMC 被丢弃（原因）: 原文` 供定位 |
 | `ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0` | NTP 请求 / 应答 / **未同步未应答** / 非法报文 / 被令牌桶丢弃 / 发送失败 |
@@ -227,6 +227,7 @@ I (48026284) mon: LINK UP 192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED  stra
   （`sats_used >= CFG_GPS_MIN_SATS`）。
 - **接了 5 Hz / 10 Hz 模块后锁不上、或串口像"堵住"**：先看日志里的 `nmea=OK/BAD` 与 `baud=`。每秒只应采纳 1 组整数秒报文（约 10 条）；若 `OK` 每秒增长远少于这个数、而 `BAD` 持续增长，说明**串口物理带宽不够**（例：5 Hz 全语句 @ 9600 约 3 KB/s，而 9600 只有约 0.96 KB/s，必然丢字节），固件的整段筛选救不了 —— 需要把模块改到 115200，或用厂商工具 / UBX-CFG 把输出降到 1 Hz、裁掉 VTG/GSA/GLL/GSV。带宽足够时（例如 115200），整段筛选会正常完成对齐与锁定。
 - **串口偶发 `N 秒未收到合法 NMEA，重新探测波特率`**：这是模块掉电重启 / 被换 / 波特率被改之后的自愈动作（`CFG_GPS_RELOCK_SEC`，默认 15 s）。探测是只读的、失败会恢复原波特率；嫌频繁可调大该值，设 0 关闭。
+- **运行数小时后突然 `UNLOCKED`，日志反复出现 `RMC 被丢弃（status 不是 A（模块报告定位无效））`**：这是**模块侧**掉了定位，不是固件问题 —— 报文里 RMC 的 status 是 `V`、GGA 的 `fixq=0`/`sats=0`，有些模块还会连 PPS 一起停（表现为 `pps=` 不再增长、`hold` 一路涨大）。固件此时会**按设计拒绝采纳它的时间**：RMC 直接丢弃；GGA 兜底额外要求当前定位合格（`fix_ok`）且与钟面相差 ≤1 s；即使偏差恰好是整数秒，只要超过 `CFG_NMEA_SLIP_MAX_SEC`（默认 600 s）也不会"滑移"对齐，只丢弃并告警。模块重新拿到定位后会自动恢复。
 - **HTTP 页面读取失败**：查看 `/status.json` 是否为合法 JSON，先用串口日志确认服务已起。
 
 ---
@@ -471,7 +472,7 @@ Field-by-field meaning:
 | `LOCKED stratum=1 li=0` | Lock state / NTP stratum / Leap Indicator (LI) |
 | `off=0us jit=1us ppb=5004` | PPS phase error / jitter / frequency correction (ppb) |
 | `hold=956ms pps=189414/0` | Holdover duration (`n/a(无PPS)` if PPS never seen) / PPS total and missed |
-| `sats=9/11 fixq=1 hdop=2.5 [FIX]` | Satellites (**in-solution / visible**) / Fix Quality / HDOP / fix valid |
+| `sats=9/11 fixq=1 hdop=2.5 [FIX]` | Satellites (**in-solution / sum of all constellations' visible counts**) / Fix Quality / HDOP / fix valid. `fix valid` requires fix quality within [`CFG_GPS_FIXQ_MIN`, `CFG_GPS_FIXQ_MAX`] (default **1–5**, i.e. 6=estimated and 8=simulated are rejected) **and** in-solution satellites ≥ `CFG_GPS_MIN_SATS` |
 | `baud=115200 cfg=0 nmea=12/0` | Current GNSS baud rate (auto-detected) / UBX config messages sent (always 0 with defaults) / **accepted NMEA sentences / bad frames** (bad frames growing = dropped bytes: not enough bandwidth or a bad signal) |
 | `rmc=1/1/0/0 gga=0` | RMC breakdown: **seen / used for timing / unusable content / dropped by the whole-second filter**, plus **`gga` = times the GGA timestamp was used as a fallback while RMC was unusable**. `seen` flat = the module emits no RMC at all (no absolute second → it can never lock); `seen` rising but `used` flat = the RMC itself is unusable (status='V' or truncated fields) — the firmware then falls back to GGA automatically (watch `gga`) and logs one `RMC 被丢弃（reason）: <sentence>` every 10 s to pin down the cause |
 | `ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0` | NTP requests / responses / **valid but not answered (no time base yet)** / invalid / dropped by token bucket / send failures |
@@ -500,6 +501,7 @@ Field-by-field meaning:
 - **RMC never matches PPS**: check the GNSS baud was detected (`baud_locked`), whether GSV is too
   long and causes cross-second (turn off `CFG_GPS_KEEP_GSV`, which likewise **requires
   `CFG_GPS_SEND_UBX_CFG=1`**), and whether the fix qualifies (`sats_used >= CFG_GPS_MIN_SATS`).
+- **Drops to `UNLOCKED` after hours of running, with repeated `RMC 被丢弃（status 不是 A（模块报告定位无效））`**: that is the **module** losing its fix, not a firmware problem — the RMC `status` is `V`, GGA shows `fixq=0`/`sats=0`, and some modules even stop PPS (the log then shows `pps=` frozen and `hold` growing). The firmware deliberately refuses to trust such a time source: RMC is dropped, the GGA fallback additionally requires a valid fix (`fix_ok`) and ≤1 s agreement with the current clock face, and even an integer-second offset beyond `CFG_NMEA_SLIP_MAX_SEC` (default 600 s) is discarded with a warning instead of being "slipped" into the clock. It re-locks automatically once the module regains its fix.
 - **Won't lock with a 5 Hz / 10 Hz module, serial looks "clogged"**: check `nmea=OK/BAD` and `baud=`
   in the log. Only one whole-second burst per second (~10 sentences) should be accepted; if `OK`
   grows far slower than that while `BAD` keeps rising, the **serial link is physically saturated**
