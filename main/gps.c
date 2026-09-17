@@ -62,6 +62,15 @@ static uint64_t     s_burst_mark_us;    /* 最近一次界标语句的时刻（�
 static int          s_utc_y, s_utc_mo, s_utc_d;   /* 最近一次 RMC 给出的 UTC 日期 */
 static uint64_t     s_rmc_ok_tb;                  /* 最近一次 RMC 对时的时刻（µs） */
 
+/* 模块"抢救"机制是否启用：见 config.h 的 CFG_GPS_RST_MODE / CFG_GPS_REFIX_* 说明。 */
+#if CFG_GPS_RST_MODE > 0 && CFG_GPS_REFIX_SEC > 0
+#define GPS_RECOVER_ENABLED 1
+static uint64_t     s_last_fix_tb;                /* 最近一次"定位合格"的时刻（µs） */
+static uint32_t     s_restart_cnt;                /* 连续恢复尝试次数 */
+#else
+#define GPS_RECOVER_ENABLED 0
+#endif
+
 /* ====================== 日期 / 闰秒工具 ============================ */
 static int is_leap(int y)
 {
@@ -674,9 +683,17 @@ static bool probe_baud_loop(void)
 }
 
 #if CFG_GPS_SET_BAUD
-/* 用 UBX-CFG-PRT 把模块切到目标波特率；失败自动回退。
- * 注意：这是写操作，默认关闭（CFG_GPS_SET_BAUD=0）。 */
-static bool try_switch_baud(uint32_t target)
+/* 发一次 UBX-CFG-PRT，把模块切到 target；判据是"切过去后还能不能收到报文"。
+ *
+ * 为什么不拿 ACK 当判据：CFG-PRT 改的就是端口自己的传输参数，u-blox 文档明确
+ * 提醒"这条消息的应答本身可能要用新的接收参数才收得到"。实测 AF68GBR（中科微
+ * 系兼容模块）在 38400 下完全不回 ACK，但指令其实是生效的 —— 拿 ACK 当门槛会
+ * 把本来能用的模块判死。所以流程是：
+ *   发 CFG-PRT（顺带看一眼有没有 ACK，只用于日志）→ 本机也切过去 → 开 2 s 窗口
+ *   看有没有有效报文；有就留下，没有就切回去。
+ * 回退是安全的：模块若没理会这条指令，回退后数据流立刻恢复；模块若已经切了而
+ * 本机新速率下收不到（线材/干扰），回退后同样收不到，会由 RELOCK 机制重新探测。 */
+static bool try_switch_baud_once(uint32_t target)
 {
     if (target == s_baud) {
         return true;
@@ -700,16 +717,13 @@ static bool try_switch_baud(uint32_t target)
     s_ack_id  = 0;
     ubx_send(0x06, 0x00, p, 20);
     s_st.cfg_sent++;
-    pump_uart(500, false);
+    pump_uart(400, false);                       /* 只为看一眼 ACK/NAK */
+    int acked = (s_got_ack && s_ack_cls == 0x06 && s_ack_id == 0x00) ? 1 : 0;
 
-    if (!s_got_ack || s_ack_cls != 0x06 || s_ack_id != 0x00) {
-        ESP_LOGW(TAG, "CFG-PRT -> %u 未收到 ACK，保持 %u", (unsigned)target, (unsigned)s_baud);
-        return false;
-    }
-
+    /* 本机切过去，看数据流还在不在 —— 这才是真判据 */
     uint32_t old = s_baud;
     uart_set_baudrate(CFG_GPS_UART, target);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(50));               /* 等模块让新参数生效、本机稳定 */
     uart_flush_input(CFG_GPS_UART);
     reset_parser();
     s_baud = target;
@@ -718,19 +732,48 @@ static bool try_switch_baud(uint32_t target)
     s_detect_hit = false;
     pump_uart(2000, true);
     if (s_detect_hit) {
-        ESP_LOGI(TAG, "GPS 波特率已切换到 %u", (unsigned)target);
+        ESP_LOGI(TAG, "GPS 波特率已切换到 %u%s（ack=%d nak=%lu）",
+                 (unsigned)target, acked ? "" : "，模块未回 ACK 但数据流正常",
+                 acked, (unsigned long)s_st.ubx_nak);
         return true;
     }
 
-    /* 回退 */
+    /* 收不到 → 切回去，并确认回退后数据流仍在 */
     uart_set_baudrate(CFG_GPS_UART, old);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(50));
     uart_flush_input(CFG_GPS_UART);
     reset_parser();
     s_baud = old;
     update_byte_time();
-    ESP_LOGW(TAG, "新波特率 %u 下收不到数据，已回退到 %u", (unsigned)target, (unsigned)old);
+    s_detect_hit = false;
+    pump_uart(500, true);
+    ESP_LOGW(TAG, "%u 下收不到数据，回退到 %u（ack=%d nak=%lu）",
+             (unsigned)target, (unsigned)old, acked, (unsigned long)s_st.ubx_nak);
     return false;
+}
+
+/* 上电握手成功 / 模块重启后调用：尽量把模块往高波特率上提（越高 lag 越小）。
+ * 只往上试、不降速 —— 降速只会让滞后变大。从候选表里挑 "高于当前 且 不超过
+ * cap" 的项，从高到低逐个尝试，第一个成功的就是可用范围内最高的速率；全都不
+ * 成功就留在原波特率（每次失败都已在 try_switch_baud_once 里切回来了）。 */
+static void try_switch_baud(uint32_t cap)
+{
+    if (cap == 0) {
+        cap = (uint32_t)s_baud_list[0];          /* 0 = 不限，取表里最高 */
+    }
+    for (int i = 0; i < (int)GPS_BAUD_N; i++) {
+        uint32_t cand = s_baud_list[i];          /* 表已按 高 → 低 排列 */
+        if (cand <= s_baud) {
+            break;                               /* 再往后只会更低，停 */
+        }
+        if (cand > cap) {
+            continue;                            /* 超出上限，跳过 */
+        }
+        if (try_switch_baud_once(cand)) {
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "保持当前波特率 %u（已是可用范围内最高）", (unsigned)s_baud);
 }
 #endif /* CFG_GPS_SET_BAUD */
 
@@ -828,6 +871,59 @@ static void publish_status(void)
     portEXIT_CRITICAL(&s_st_lock);
 }
 
+/* ====================== 模块恢复 ===================================
+ * 长期拿不到定位时用 UBX-CFG-RST 软复位"抢救"模块（CFG_GPS_RST_MODE，默认
+ * 温启动）—— 纯软件，不需要任何额外硬件。详见 config.h 的说明。 */
+#if GPS_RECOVER_ENABLED
+#if CFG_GPS_RST_MODE == 1
+#define GPS_RST_NAME "热"
+#elif CFG_GPS_RST_MODE == 3
+#define GPS_RST_NAME "冷"
+#else
+#define GPS_RST_NAME "温"
+#endif
+
+/* 发 UBX-CFG-RST 让模块自己复位。navBbrMask 决定清掉多少历史数据：
+ *   0x0000 = 热启动（全保留，最快）
+ *   0x0001 = 温启动（只清星历，保留历书/位置/时间 —— 丢定位后最常用）
+ *   0xFFFF = 冷启动（全清，最慢但最彻底）
+ * resetMode = 0x02 表示"只复位 GNSS 子系统"，**不动 UART/端口配置**，所以
+ * 波特率保持不变、不必重新握手。复位会让模块重启，通常收不到 ACK，故不等 ACK。
+ * 模块若不认这条指令（ROM 只读版 / 屏蔽了 CFG 写入），最多是没效果，无害。 */
+static void gps_ubx_reset(void)
+{
+    uint16_t bbr;
+    uint8_t  p[4];
+
+#if CFG_GPS_RST_MODE == 1
+    bbr = 0x0000;
+#elif CFG_GPS_RST_MODE == 3
+    bbr = 0xFFFF;
+#else
+    bbr = 0x0001;
+#endif
+    p[0] = (uint8_t)(bbr & 0xFF);
+    p[1] = (uint8_t)(bbr >> 8);
+    p[2] = 0x02;                        /* resetMode: GNSS-only controlled sw reset */
+    p[3] = 0x00;                        /* reserved1 */
+    ubx_send(0x06, 0x04, p, 4);
+    s_st.cfg_sent++;
+}
+
+static void gps_recover(void)
+{
+#if CFG_GPS_RST_MODE > 0
+    ESP_LOGW(TAG, "  → 发送 UBX-CFG-RST（%s启动）", GPS_RST_NAME);
+    gps_ubx_reset();
+    /* 等模块重启并重新吐数据（3 s），顺带喂狗 */
+    for (int i = 0; i < 30; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_task_wdt_reset();
+    }
+#endif
+}
+#endif /* GPS_RECOVER_ENABLED */
+
 /* ====================== 主任务 ===================================== */
 static void gps_task(void *arg)
 {
@@ -835,6 +931,10 @@ static void gps_task(void *arg)
     if (esp_task_wdt_add(NULL) != ESP_OK) {
         ESP_LOGW(TAG, "TWDT 订阅失败（任务看门狗未启用？）");
     }
+
+#if GPS_RECOVER_ENABLED
+    s_last_fix_tb = tb_now_us();            /* 给模块留足首次定位的时间 */
+#endif
 
     /* 串口驱动就装在本任务所在的核（CORE_TIME）上，UART 中断与 PPS 中断
      * 同核，NMEA 时戳估计受核间调度影响最小。 */
@@ -940,6 +1040,31 @@ static void gps_task(void *arg)
                 s_st.leap_mismatch = s_st.leap_valid && (s_st.leap_s != (int8_t)exp);
             }
         }
+
+#if GPS_RECOVER_ENABLED
+        /* ---- 长时间拿不到定位 → 软复位唤醒模块 ----
+         * 放在主循环末尾：恢复流程会阻塞几秒，走完直接进入下一轮，不会再碰到
+         * 上面的自愈 / 轮询逻辑。 */
+        if (s_st.fix_valid) {
+            s_last_fix_tb = tb_now_us();
+            s_restart_cnt = 0;                 /* 恢复定位即清零连续恢复计数 */
+        } else if ((tb_now_us() - s_last_fix_tb) > (uint64_t)CFG_GPS_REFIX_SEC * 1000000ULL) {
+            if (CFG_GPS_REFIX_MAX > 0 && s_restart_cnt >= CFG_GPS_REFIX_MAX) {
+                s_last_fix_tb = tb_now_us();   /* 已达上限：不再折腾模块，只推后检查 */
+                ESP_LOGW(TAG, "连续 %u 次尝试恢复仍无合格定位，停止重试，"
+                              "请检查天线/视野/模块供电", (unsigned)s_restart_cnt);
+            } else {
+                s_restart_cnt++;
+                ESP_LOGW(TAG, "%d 秒无合格定位，第 %u 次尝试恢复模块",
+                         CFG_GPS_REFIX_SEC, (unsigned)s_restart_cnt);
+                gps_recover();
+                reset_parser();
+                last_count    = s_st.nmea_count;    /* 复位失联自愈判据 */
+                last_active   = (uint32_t)(tb_now_us() / 1000ULL);
+                s_last_fix_tb = tb_now_us();        /* 重新计时 */
+            }
+        }
+#endif
 
         publish_status();
     }
