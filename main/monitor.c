@@ -5,6 +5,7 @@
 #include "config.h"
 #include "discipline.h"
 #include "gps.h"
+#include "gnss_tcp.h"
 #include "ntp.h"
 #include "eth_if.h"
 
@@ -81,9 +82,10 @@ static int json_append(char *buf, size_t cap, int off, const char *fmt, ...)
 
 static int build_json(char *buf, size_t cap)
 {
-    disc_status_t d;
-    gps_status_t  g;
-    ntp_stats_t   n;
+    disc_status_t    d;
+    gps_status_t     g;
+    ntp_stats_t      n;
+    gnss_tcp_stats_t t;
     char ip[32];
     char utc[40];
     uint32_t sec = 0, frac = 0;
@@ -97,6 +99,7 @@ static int build_json(char *buf, size_t cap)
     discipline_get_status(&d);
     gps_get_status(&g);
     ntp_get_stats(&n);
+    gnss_tcp_get_stats(&t);
     eth_if_get_ip(ip, sizeof(ip));
 
     bool have_utc = discipline_get_utc(tb_now_us(), &sec, &frac);
@@ -119,6 +122,8 @@ static int build_json(char *buf, size_t cap)
         "\"hdop\":%u.%u,"
         "\"leap_s\":%d,\"leap_expected\":%d,\"leap_ok\":%s,"
         "\"nmea\":%lu,\"nmea_bad\":%lu,"
+        "\"tcp_port\":%u,\"tcp_clients\":%u,\"tcp_conns\":%lu,\"tcp_rejected\":%lu,"
+        "\"tcp_sent\":%lu,\"tcp_drop\":%lu,"
         "\"rmc_seen\":%lu,\"rmc_ok\":%lu,\"rmc_bad\":%lu,\"rmc_drop\":%lu,\"gga_ts\":%lu,"
         "\"ubx_ack\":%lu,\"ubx_nak\":%lu,\"ubx_cfg\":%lu,"
         "\"holdover_valid\":%s,"
@@ -145,6 +150,10 @@ static int build_json(char *buf, size_t cap)
         (unsigned)(g.hdop_x10 / 10), (unsigned)(g.hdop_x10 % 10),
         (int)g.leap_s, (int)g.leap_expected, g.leap_mismatch ? "false" : "true",
         (unsigned long)g.nmea_count, (unsigned long)g.bad_count,
+        (unsigned)(CFG_GNSS_TCP_ENABLE ? CFG_GNSS_TCP_PORT : 0),
+        (unsigned)t.clients, (unsigned long)t.clients_total,
+        (unsigned long)t.rejected, (unsigned long)t.sent_bytes,
+        (unsigned long)t.drop_bytes,
         (unsigned long)g.rmc_seen, (unsigned long)g.rmc_ok,
         (unsigned long)g.rmc_bad, (unsigned long)g.rmc_drop,
         (unsigned long)g.gga_ts_used,
@@ -226,6 +235,7 @@ static const char *PAGE_HEAD =
     "</style></head><body>"
     "<h1>GPS / PPS NTP Server</h1>"
     "<div class=\"sub\" id=\"sub\">loading...</div>"
+    "<div class=\"sub\" id=\"tcp\"></div>"
     "<div class=\"grid\" id=\"g\"></div>"
     "<h2>明细</h2><table id=\"t\"></table>"
     "<h2>最近 NMEA 原始报文（GNGSA / GNGGA / GNZDA，共 " STR(GPS_RAW_LINES) " 条，最新在上）</h2>"
@@ -256,6 +266,7 @@ static const char *PAGE_HEAD =
     "   ['NTP 未同步丢弃',d.ntp_unsync,''],"
     "   ['NTP 发送失败',d.ntp_txfail,''],"
     "   ['入站硬件时戳',d.rx_ts_used,''],"
+    "   ['NMEA TCP 客户端',d.tcp_clients,''],"
     "   ['闰秒(模块/期望)',d.leap_s+' / '+d.leap_expected,'']"
     "  ];"
     "  document.getElementById('g').innerHTML=items.map(([k,v,u])=>"
@@ -270,6 +281,7 @@ static const char *PAGE_HEAD =
     "   ['伺服 阶跃/重对齐',d.step+' / '+d.resync],"
     "   ['伺服 整秒滑移/失配',d.slip+' / '+d.mismatch],"
     "   ['NMEA 滞后/跨秒次数',d.lag_ms+' ms / '+d.late],"
+    "   ['NMEA TCP 端口/连接/已发/丢弃',d.tcp_port+' / '+d.tcp_conns+' / '+d.tcp_sent+' / '+d.tcp_drop],"
     "   ['空闲堆',d.heap+' B'],"
     "   ['入站时戳回退',d.rx_ts_miss],['Uptime',d.uptime_s+' s']];"
     "  const tb=document.getElementById('t');"
@@ -278,6 +290,9 @@ static const char *PAGE_HEAD =
     "  const raw=(d.raw||[]).slice().reverse();"
     "  document.getElementById('raw').textContent="
     "raw.length?raw.join('\\n'):'(尚未收到 GGA/GSA/ZDA)';"
+    "  const tc=document.getElementById('tcp');"
+    "  if(tc)tc.textContent=d.tcp_port?('模块原始字节流（含 UBX 二进制帧）在 TCP '+d.tcp_port"
+    "+' —— 用串口调试助手 / telnet '+d.ip+' '+d.tcp_port+' 连接，内容与串口完全一致'):'';"
     "  document.getElementById('sub').textContent='自动刷新 · 2 s · '+new Date().toLocaleTimeString();"
     " }catch(e){"
     "  const s=document.getElementById('sub');"
@@ -356,15 +371,17 @@ static httpd_handle_t start_webserver(void)
 /* ==================== 串口诊断 ==================================== */
 static void log_diag(void)
 {
-    disc_status_t d;
-    gps_status_t  g;
-    ntp_stats_t   n;
+    disc_status_t    d;
+    gps_status_t     g;
+    ntp_stats_t      n;
+    gnss_tcp_stats_t tc;
     char ip[32], utc[40], hold[24];
     uint32_t sec = 0, frac = 0;
 
     discipline_get_status(&d);
     gps_get_status(&g);
     ntp_get_stats(&n);
+    gnss_tcp_get_stats(&tc);
     eth_if_get_ip(ip, sizeof(ip));
 
     if (discipline_get_utc(tb_now_us(), &sec, &frac)) {
@@ -381,7 +398,7 @@ static void log_diag(void)
              "hold=%s pps=%lu/%lu | sats=%u/%u fixq=%u hdop=%u.%u %s | "
              "baud=%lu cfg=%lu nmea=%lu/%lu rmc=%lu/%lu/%lu/%lu gga=%lu | "
              "ntp req=%lu resp=%lu unsync=%lu bad=%lu drop=%lu txfail=%lu | rxTs %lu/%lu | linkup=%lu | "
-             "sv %lu/%lu/%lu/%lu/%lu | lag=%lums | heap=%luKB",
+             "nmeaTcp %u/%lu/%lu | sv %lu/%lu/%lu/%lu/%lu | lag=%lums | heap=%luKB",
              eth_if_link_up() ? "LINK UP " : "LINK DOWN", ip, utc,
              d.locked ? "LOCKED  " : "UNLOCKED", (unsigned)d.stratum, (unsigned)d.li,
              (long long)d.offset_us, (long long)d.jitter_us, (long)d.ppb,
@@ -399,6 +416,9 @@ static void log_diag(void)
              (unsigned long)n.send_fail,
              (unsigned long)n.rx_ts_used, (unsigned long)n.rx_ts_miss,
              (unsigned long)eth_if_link_up_count(),
+             /* NMEA TCP 转发：当前客户端数 / 累计连接数 / 缓冲丢弃字节 */
+             (unsigned)tc.clients, (unsigned long)tc.clients_total,
+             (unsigned long)tc.drop_bytes,
              /* 阶跃 / 重对齐 / 整秒滑移 / 失配 / 传输跨秒 */
              (unsigned long)d.step_count, (unsigned long)d.resync_count,
              (unsigned long)d.slip_count, (unsigned long)d.mismatch_count,

@@ -253,9 +253,7 @@ static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
 /* ------------------------- 初始化 ---------------------------------- */
 void eth_if_init(void)
 {
-    /* 0) 先给 WT32-ETH01 的板载 50MHz 振荡器供电使能。
-     *    IO0 上的 REF_CLK 来自它，而不是 ESP32 内部 PLL。
-     *    必须在 install / MAC 初始化之前完成，否则 MAC 复位会一直失败。 */
+    /* 0) 先给 WT32-ETH01 的板载 50MHz 振荡器供电使能。*/
     eth_clock_enable();
 
     /* 1) MAC */
@@ -267,9 +265,6 @@ void eth_if_init(void)
     emac_cfg.interface                      = EMAC_DATA_INTERFACE_RMII;
     emac_cfg.smi_gpio.mdc_num               = CFG_ETH_MDC_GPIO;
     emac_cfg.smi_gpio.mdio_num              = CFG_ETH_MDIO_GPIO;
-    /* 外部 50MHz 灌进 IO0 —— 绝不能写成 EMAC_CLK_OUT，
-     * 否则 ESP32 会在 IO0 上反向输出自己的 50MHz，和板载振荡器打架，
-     * 表现为 link 每几百毫秒 UP/DOWN 反复翻动。 */
     emac_cfg.clock_config.rmii.clock_mode   = CFG_ETH_CLK_MODE;   /* EMAC_CLK_EXT_IN */
     emac_cfg.clock_config.rmii.clock_gpio   = CFG_ETH_CLK_GPIO;   /* IO0 */
     esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&emac_cfg, &mac_cfg);
@@ -365,11 +360,6 @@ void eth_if_periodic(void)
         s_down_since_s = 0;          /* 链路正常：清掉计时基准 */
         return;
     }
-    /* 【关键】上电时网线就没插好的话，驱动内部的初始 link 状态本就是 down，
-     * 不会产生 DISCONNECTED 事件，s_down_since_s 会一直是 0 —— 于是这里
-     * 永远"认为"还没断满 CFG_ETH_RECOVER_SEC，重建 PHY 的逻辑永不触发。
-     * 因此把"首次观察到 link down"的时刻惰性记录下来。
-     * （s_down_since_s == 0 是本模块约定的"尚未记录"哨兵。） */
     if (s_down_since_s == 0) {
         uint32_t now_s = (uint32_t)(tb_now_us() / 1000000ULL);
         s_down_since_s = (now_s != 0) ? now_s : 1u;

@@ -17,9 +17,6 @@ extern "C" {
 
 /* ========================== 以太网 / 网络 ==========================
  * IP 获取方式：只支持 DHCP 自动分配（地址由路由器分配，换网段即插即用）。
- * 说明：这里曾有一个 CFG_USE_DHCP 开关声称"0 = 静态 IP"，但
- * ESP_NETIF_DEFAULT_ETH() 生成的 netif 自带 ESP_NETIF_DHCP_CLIENT 标志，
- * 把它关掉既不会配置静态地址、也拦不住 dhcpc，属于死配置，已删除。
  * 若确实需要静态地址：自行在 eth_if_init() 里 esp_netif_dhcpc_stop() +
  * esp_netif_set_ip_info()，并把 sdkconfig 的 DHCP 相关选项一并考虑。
  * ------------------------------------------------------------------ */
@@ -29,26 +26,6 @@ extern "C" {
 /* 链路 DOWN 超过该秒数后强制 stop/start 重建 PHY；0 = 不重建 */
 #define CFG_ETH_RECOVER_SEC    30
 
-/* ================== WT32-ETH01 以太网专用 GPIO（禁复用）==================
- * RMII 数据面 : IO21(TX_EN) IO19(TXD0) IO22(TXD1) IO27(CRS_DV)
- *               IO25(RXD0) IO26(RXD1) IO35(RX_ER)
- * SMI         : IO23(MDC)  IO18(MDIO)
- *
- * 【关键】WT32-ETH01 的 RMII 参考时钟不是 ESP32 产生的，而是板载 50MHz
- *         有源振荡器灌进 IO0 的：
- *           - IO16 = 该振荡器的使能脚，必须拉高，否则 PHY/MAC 无时钟；
- *                    官方资料里常被当成 "PHY power"，它同时也被许多例程
- *                    误当成 PHY nRST 使用——只要最终为高电平就恰好能用。
- *           - IO0  = 50MHz REF_CLK 输入 -> clock_mode 必须是 EMAC_CLK_EXT_IN。
- *             绝不能用 EMAC_CLK_OUT（ESP32 在 IO0 往外灌自己的 50MHz，
- *             会和板载振荡器在 IO0 上打架 -> RMII 数据错 -> link 反复翻动）。
- *           - PHY 的 nRST 在 WT32-ETH01 上没有接到任何 GPIO，
- *             所以 reset_gpio_num 必须是 -1；
- *             注意 ETH_PHY_DEFAULT_CONFIG() 默认 reset_gpio_num = 5，
- *             既违背硬件，又和 GPS 的 RXD(IO5) 冲突。
- *        同时 UART2 默认脚位是 IO16/IO17，已通过 uart_set_pin() 改到
- *        IO17/IO5，把 IO16 完全留给振荡器使能。
- * ------------------------------------------------------------------ */
 #define CFG_ETH_MDC_GPIO       23
 #define CFG_ETH_MDIO_GPIO      18
 /* IO0: 外部 50MHz REF_CLK 输入 */
@@ -136,19 +113,6 @@ extern "C" {
  * 设上限是为了避免"天线坏 / 室内无信号"时无休止折腾模块 —— 反复复位/冷启动
  * 只会让定位更难。一旦重新拿到定位，计数清零，下次超时仍会重试。 */
 #define CFG_GPS_REFIX_MAX      3
-
-/* ======= 是否改写 GPS 模块自身的配置 =======
- * 默认立场仍是"拿来就用，不改模块"（兼容 ROM 只读版 / 厂商屏蔽 CFG 写入的
- * 模块），但 **CFG_GPS_SET_BAUD 默认打开**：上电握手成功后主动用 UBX-CFG-PRT
- * 把模块切到 115200。
- *   为什么值得这么做：9600 下一个 NMEA 突发要传 0.6~0.7 s，RMC 相对 PPS 的
- *   滞后（日志里的 lag）就有 600+ ms；115200 下同样内容只需 ~50 ms，lag 直接
- *   降一个数量级，配对窗口与授时裕度都宽松得多。
- *   失败是安全的：模块不认（NAK / 不响应），或切过去收不到数据，都会自动回退
- *   到原波特率继续用（见 gps.c 的 try_switch_baud）。
- * 其余改写模块的项（CFG-RATE / CFG-MSG / CFG-TP5 / CFG-NAV5）仍默认关闭，
- * 见 CFG_GPS_SEND_UBX_CFG。
- * ------------------------------------------------------------------ */
 
 /* 上电握手成功后，是否用 UBX-CFG-PRT 把模块往高波特率上提（写操作）。
  * 做法：从 CFG_GPS_BAUD_LIST 里挑 "高于当前 且 不超过 CFG_GPS_TARGET_BAUD" 的
@@ -258,6 +222,33 @@ extern "C" {
  * （CONFIG_LWIP_UDP_RECVMBOX_SIZE）；太浅会在突发时挤出时戳（丢弃最旧），
  * 表现为 rx_ts_miss 增长。必须是 2 的幂。 */
 #define CFG_RX_TS_RING         32
+
+/* ================ GNSS 原始报文 TCP 转发（远程"串口调试助手"）==============
+ * 把 GNSS 模块吐在串口上的原始字节流原样转发到一个 TCP 端口：串口调试助手 /
+ * telnet / nc 远程连上来，看到的就是模块的真实输出 —— NMEA 文本行、模块对
+ * UBX 查询的二进制应答、校验失败的坏帧，乃至波特率探测期间收到的乱码。
+ * 作用：判断"模块的工作健康状况"。面板上的统计是结论，这里是一手证据；
+ * 两者合看才能分清"模块拿不到定位"和"模块/串口根本没在工作"。
+ *
+ * 数据面全在 CORE_NET 上的独立任务里；GPS 任务侧只多一次无锁 memcpy（写环形
+ * 缓冲），不阻塞、不取信号量，因此不影响 PPS/NMEA 时基（见 gnss_tcp.c）。
+ * 服务只出不进：不解析客户端发来的任何字节（收到即丢弃，仅用于探测断开）。
+ *
+ * 注意：客户端数要占用 lwip socket，改大这里时留意 sdkconfig 的
+ * CONFIG_LWIP_MAX_SOCKETS 是否还够（见 sdkconfig.defaults）。
+ * ------------------------------------------------------------------ */
+#define CFG_GNSS_TCP_ENABLE        1      /* 0 = 完全关闭（连字节投递都不做） */
+#define CFG_GNSS_TCP_PORT          8880
+#define CFG_GNSS_TCP_MAX_CLIENTS   3      /* 同时连接的客户端数上限 */
+/* 环形缓冲字节数（必须是 2 的幂）：115200 下一个 NMEA 突发约 1.5 KB，4096 B
+ * 足以吸收一次瞬时拥塞；再大只是白占 RAM。缓冲放不下时丢"最新"字节并计数。 */
+#define CFG_GNSS_TCP_RING          4096
+#define CFG_GNSS_TCP_TX_CHUNK      1024   /* 单次发送块大小（任务栈上的缓冲） */
+#define CFG_GNSS_TCP_POLL_MS       20     /* 轮询周期：报文转发延迟的上限 */
+/* 任务栈：含 CFG_GNSS_TCP_TX_CHUNK 的发送缓冲与连接提示，另留 lwIP 调用深度 */
+#define CFG_GNSS_TCP_TASK_STACK    5120
+/* 与 NTP 任务同理，刻意低于 lwIP tcpip 线程，避免优先级反转 */
+#define CFG_GNSS_TCP_TASK_PRIO     (CONFIG_LWIP_TCPIP_TASK_PRIO - 1)
 
 /* ====================== 双核分工（ESP32 双核）======================
  * CORE_TIME(CPU0 = PRO)：PPS 硬件中断、时基伺服、GPS 串口/UART 中断与 NMEA 解析。

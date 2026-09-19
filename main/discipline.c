@@ -200,7 +200,6 @@ static inline int pps_avail(void)
  * 早先是"在最近 8 条边沿里取 |RMC秒 - 边沿推算秒| 最小的 那条"。由于 PPS 恰好
  *  1 s 一条，一旦时钟整体偏了 k 秒，第 k 条旧边沿就会
  * 给出 0 残差而被选中 —— 于是误差被判成"完全正常"，从此永远不再纠正。
- * 日志里就表现为：时钟恒定领先 GPS 7 秒，同时每秒打印一条"传输跨秒"。
  * 所以候选必须限制在 (a)(b) 两条，多一秒就必须是失配并强制重对齐。
  * ------------------------------------------------------------------ */
 static int pick_candidate_index(uint64_t est_start_tb, int avail)
@@ -453,8 +452,6 @@ void discipline_get_status(disc_status_t *st)
 
     st->pps_ok       = s_pps_ok;
     st->nmea_ok      = s_nmea_ok;
-    /* 【必须有】以前这里漏了 fix_ok，而失锁日志会打印它 —— 打出来的是
-     * 未初始化局部变量的栈垃圾，最容易在排障时误导判断。 */
     st->fix_ok       = s_fix_ok;
     st->locked       = s_locked;
     st->holdover_ms  = s_holdover_ms;

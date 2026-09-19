@@ -19,13 +19,14 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 # 不必切到 tcpip 线程，发送时戳更贴近实际上线路时刻
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 CONFIG_LWIP_TCPIP_CORE_LOCKING_INPUT=y
-# UDP 接收队列深度：这是 lwIP 里 UDP 真正的"缓冲"，
-# 默认 6 太浅，突发 NTP 查询会直接丢包
+# UDP 接收队列深度：默认 6 太浅，突发 NTP 查询会直接丢包
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 # 允许 setsockopt(SO_RCVBUF)
 CONFIG_LWIP_SO_RCVBUF=y
-CONFIG_LWIP_MAX_SOCKETS=12
+# socket 总数：HTTP 服务器（CFG_MONITOR 里 max_open_sockets=5）+ NTP 1 个
+# + GNSS 原始报文 TCP 转发（1 个监听 + CFG_GNSS_TCP_MAX_CLIENTS 个客户端）
+CONFIG_LWIP_MAX_SOCKETS=16
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
 # lwIP tcpip 线程固定到 CPU1（网络核），
 # 让 CPU0 专心跑 PPS 中断 / 时基伺服 / GPS 串口，减少中断响应抖动

@@ -4,6 +4,7 @@
 #include "gps.h"
 #include "config.h"
 #include "discipline.h"
+#include "gnss_tcp.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -628,6 +629,10 @@ static void pump_uart(uint32_t ms, bool probe)
                 uint64_t ti = t_end - ((((uint64_t)(n - 1 - i)) * s_byte_us_q16) >> 16);
                 feed_byte(b[i], ti);
             }
+            /* 原始字节转发给 TCP（远程观察用）放在最后：授时的时标与解析先走完，
+             * 转发多花的那点时间落不到任何时间量上（见 gnss_tcp.c 顶部说明）。
+             * 探测阶段的乱码也照转 —— 那正是"模块到底在说什么"的一部分。 */
+            gnss_tcp_feed(b, (size_t)n);
             if (probe && s_detect_hit) {
                 break;
             }
@@ -684,13 +689,6 @@ static bool probe_baud_loop(void)
 
 #if CFG_GPS_SET_BAUD
 /* 发一次 UBX-CFG-PRT，把模块切到 target；判据是"切过去后还能不能收到报文"。
- *
- * 为什么不拿 ACK 当判据：CFG-PRT 改的就是端口自己的传输参数，u-blox 文档明确
- * 提醒"这条消息的应答本身可能要用新的接收参数才收得到"。实测 AF68GBR（中科微
- * 系兼容模块）在 38400 下完全不回 ACK，但指令其实是生效的 —— 拿 ACK 当门槛会
- * 把本来能用的模块判死。所以流程是：
- *   发 CFG-PRT（顺带看一眼有没有 ACK，只用于日志）→ 本机也切过去 → 开 2 s 窗口
- *   看有没有有效报文；有就留下，没有就切回去。
  * 回退是安全的：模块若没理会这条指令，回退后数据流立刻恢复；模块若已经切了而
  * 本机新速率下收不到（线材/干扰），回退后同样收不到，会由 RELOCK 机制重新探测。 */
 static bool try_switch_baud_once(uint32_t target)
@@ -949,8 +947,6 @@ static void gps_task(void *arg)
     ESP_ERROR_CHECK(uart_driver_install(CFG_GPS_UART, CFG_GPS_UART_RX_BUF,
                                         CFG_GPS_UART_TX_BUF, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(CFG_GPS_UART, &cfg));
-    /* 显式把 UART2 从默认 IO16/IO17 改到 IO17(TX)/IO5(RX)，
-     * 把 IO16 完全让给以太网 50MHz 振荡器使能，消除引脚冲突 */
     ESP_ERROR_CHECK(uart_set_pin(CFG_GPS_UART, CFG_GPS_TX_GPIO, CFG_GPS_RX_GPIO,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_LOGI(TAG, "UART%d 已启动: TX=IO%d RX=IO%d，自动波特率 %u..%u",
@@ -992,6 +988,9 @@ static void gps_task(void *arg)
                 uint64_t ti = t_end - ((((uint64_t)(n - 1 - i)) * s_byte_us_q16) >> 16);
                 feed_byte(buf[i], ti);
             }
+            /* 原始字节转发给 TCP（远程观察用）。放在解析之后：时基与解析先走完，
+             * 转发不会挤进授时路径（见 gnss_tcp.c 顶部说明）。 */
+            gnss_tcp_feed(buf, (size_t)n);
         }
         esp_task_wdt_reset();
 

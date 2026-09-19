@@ -23,6 +23,7 @@
 - **双核分工**：CPU0 = 时基 / PPS / GPS（时间敏感，独占）；CPU1 = 以太网 / lwIP / NTP / HTTP（与 lwIP tcpip 线程同核）。
 - **以太网健壮性**：DHCP 获取地址；自定义 input path 抓 NTP 入站帧到达时刻；断链超时强制重建 PHY，暴露 link UP 计数以观察是否仍在翻动。
 - **Web 监控面板**：实时显示锁定状态、相位误差、频率修正、卫星数、Holdover 等，并保留最近15 条 GNGGA / GNGSA / GNZDA 原始报文便于排障。
+- **远程查看 GNSS 原始报文（排障利器）**：把 GNSS 串口上的**原始字节流**（NMEA 文本 + 模块的 UBX 二进制应答 + 校验失败的坏帧 + 波特率探测期间的乱码）原样转发到 **TCP/8880**，用串口调试助手 / telnet / nc 远程连上就能看到模块"到底在说什么"，不必抱着笔记本蹲在设备旁接串口线。判断模块健康状况时，面板上的统计是"结论"、这份原始流是"一手证据"。对授时链路零干扰：GPS 任务侧只多一次无锁 `memcpy`，socket 收发全在网络核的独立任务里（见 `gnss_tcp.c`）。
 - **任务看门狗（TWDT）**：10s 无心跳即 panic 复位，防止静默卡死。
 
 ---
@@ -52,6 +53,7 @@
  │  • 时基伺服 PLL/FLL       │      │  • lwIP tcpip 线程        │
  │  • GPS UART + NMEA 解析   │      │  • NTP socket 任务        │
  │                          │      │  • HTTP 监控服务器         │
+ │                          │      │  • GNSS 原始报文 TCP 转发  │
  └──────────────────────────┘      └──────────────────────────┘
          ▲  PPS / NMEA                    ▲  ETH / NTP / HTTP
          │  (时间敏感，独占)              │  (与 tcpip 同核)
@@ -71,6 +73,7 @@
 | `ntp.c`        | NTPv4 服务器（RFC 5905）、令牌桶、入站时戳                   |
 | `eth_if.c`     | LAN8720 RMII 驱动、DHCP、断链重建、入站帧时戳                |
 | `monitor.c`    | Web 状态面板 + 串口诊断输出                                  |
+| `gnss_tcp.c`   | GNSS 串口原始字节流的 TCP 转发（TCP/8880，远程串口调试）     |
 
 ---
 
@@ -107,6 +110,7 @@ idf.py build
 - `CONFIG_LWIP_UDP_RECVMBOX_SIZE=32`：UDP 接收队列加深，避免突发丢包。
 - `CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y`：lwIP tcpip 线程固定到 CPU1（网络核）。
 - `CONFIG_LWIP_SO_RCVBUF=y`：允许 `setsockopt(SO_RCVBUF)`。
+- `CONFIG_LWIP_MAX_SOCKETS=16`：socket 总数（HTTP 面板 5 + NTP 1 + GNSS 原始报文 TCP 转发 1 监听 + 客户端）。
 - `CONFIG_ESP_TASK_WDT_EN=y` / `INIT=n`：由 `app_main()` 显式 `esp_task_wdt_init()`。
 
 ---
@@ -133,6 +137,8 @@ idf.py build
 | `CFG_PPB_LIMIT`                | `100000` | 频率修正常数上限（ppb，±100 ppm）               |
 | `CFG_NTP_SO_RCVBUF`             | `16384` | NTP socket 接收缓冲                              |
 | `CFG_NTP_RATE_PPS` / `BURST`    | `400`/`800` | 令牌桶平均/突发限速                          |
+| `CFG_GNSS_TCP_ENABLE` / `PORT`  | `1`/`8880` | GNSS 串口原始字节流的 TCP 转发（远程串口调试；`0` 关闭） |
+| `CFG_GNSS_TCP_MAX_CLIENTS` / `RING` | `3`/`4096` | 同时连接客户端数上限 / 环形缓冲字节数（2 的幂） |
 | `CFG_CORE_TIME` / `CFG_CORE_NET`| `0`/`1` | 双核分工（UNICORE 下均为 0）                    |
 
 ---
@@ -148,8 +154,55 @@ idf.py build
 - **GNSS 卫星数（参与解算 / 可见）**、Fix Quality、HDOP、当前波特率
 - **伺服事件计数**：step / resync / slip / mismatch / late（排障用，持续上涨说明对时链路有问题）
 - **最近 15 条原始报文**：GNGGA / GNGSA / GNZDA，便于核对定位与授时是否正常
+- **NMEA TCP 客户端数**：当前有几个连接正在通过 TCP/8880 看原始字节流
 
 状态数据同时以 JSON 提供：`http://<设备IP>/status.json`（供脚本/监控系统集成）。
+
+---
+
+## 远程查看 GNSS 原始报文（TCP/8880）
+
+设备会把 GNSS 模块**吐在串口上的原始字节**（与串口线上出现的完全一致）转发到 **TCP 8880**，
+于是坐在另一台机器上就能"接上"模块的串口，用来判断模块到底在工作还是在装死：
+
+```bash
+# Linux / macOS / Windows(WSL) 都行；Windows 也可以直接用串口调试助手的 TCP Client 模式
+nc 192.168.1.50 8880
+# 或者
+telnet 192.168.1.50 8880
+```
+
+连上后先收到 2~3 行以 `#` 开头的提示（当前波特率、fix 状态、时基是否已锁定），
+随后就是模块输出的原始字节：
+
+```
+# GNSS raw TCP feed - the bytes below come from the GNSS UART as-is
+# 2026-09-15 04:00:31 UTC | baud=115200 fixq=1 sats=9/11 FIX
+# Lines starting with '#' are added by this server, not by the GNSS module.
+$GNRMC,040031.00,A,3959.12345,N,11618.54321,E,0.021,,150926,,,A,V*33
+$GNGGA,040031.00,3959.12345,N,11618.54321,E,1,09,1.02,45.3,M,-8.4,M,,*6A
+...
+```
+
+几点说明：
+
+- **内容与串口完全一致**：除了 NMEA 文本行，还会看到模块对 UBX 查询/配置的二进制应答
+  （例如上电提速时的 `CFG-PRT` ACK/NAK）、校验失败的坏帧，以及波特率探测期间收到的乱码 ——
+  排障时这些恰恰是最有用的信息。
+- **只出不进**：服务器不解析客户端发来的任何内容（收到即丢弃，仅用于探测断开）。
+- **不影响授时**：GPS 任务侧只多做一次无锁 `memcpy`，socket 收发全在 CPU1 的独立任务里；
+  面板上的 `NMEA TCP 端口/连接/已发/丢弃` 可以确认转发是否正常。
+- 客户端最多 `CFG_GNSS_TCP_MAX_CLIENTS`（默认 3）个；某个客户端读得太慢会被直接断开
+  （它拖慢不了别人，重连即可）。没有任何客户端时不占用缓冲，也不累计丢弃计数。
+- 不想暴露：把 `CFG_GNSS_TCP_ENABLE` 设为 `0`（连字节投递都省掉）。
+
+**典型用法** —— 把三种"看起来都像坏了"的情形分开：
+
+| 现象 | 结论 |
+|------|------|
+| 有完整且校验正确的 NMEA 流水，但 `sats=0`、RMC 的 `status='V'` | 模块供电 / 串口 / 波特率都正常，**纯粹是拿不到定位**（天线、视野、干扰） |
+| 一个字节都没有，或只有乱码 | 波特率不对、串口线/焊点有问题、模块没上电 —— 与定位无关 |
+| 只有零星字节、NMEA 行经常截断，且面板 `nmea_bad` 持续增长 | 串口物理带宽不够（例如 5 Hz 全语句 @9600），需要提速或裁剪输出 |
 
 ---
 
@@ -180,7 +233,7 @@ chronyc sources -v
 下面是一台**已锁定**设备的真实样例（数值节选自实际运行日志）：
 
 ```
-I (48026284) mon: LINK UP  192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED   stratum=1 li=0 | off=0us jit=1us ppb=5004 | hold=956ms pps=189414/0 | sats=9/11 fixq=1 hdop=2.5 [FIX] | baud=115200 cfg=1 nmea=1234/0 rmc=1180/1170/0/5 gga=0 | ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0 | rxTs 8/0 | linkup=1 | sv 1/1/2/1/128 | lag=48ms | heap=217KB
+I (48026284) mon: LINK UP  192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED   stratum=1 li=0 | off=0us jit=1us ppb=5004 | hold=956ms pps=189414/0 | sats=9/11 fixq=1 hdop=2.5 [FIX] | baud=115200 cfg=1 nmea=1234/0 rmc=1180/1170/0/5 gga=0 | ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0 | rxTs 8/0 | linkup=1 | nmeaTcp 1/1/0 | sv 1/1/2/1/128 | lag=48ms | heap=217KB
 ```
 
 逐字段含义：
@@ -198,6 +251,7 @@ I (48026284) mon: LINK UP  192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED   st
 | `ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0` | NTP 请求 / 应答 / **未同步未应答** / 非法报文 / 被令牌桶丢弃 / 发送失败 |
 | `rxTs 8/0` | 使用了驱动层入站硬件时戳的次数 / 回退到 socket 时刻的次数 |
 | `linkup=1` | 累计 link UP 次数（持续上涨说明链路仍在翻动） |
+| `nmeaTcp 1/1/0` | GNSS 原始报文 TCP 转发（`CFG_GNSS_TCP_*`）：**当前客户端数 / 累计连接数 / 缓冲丢弃字节**。丢弃持续增长说明某个客户端读得太慢（会被断开） |
 | `sv 1/1/2/1/128` | 伺服事件：阶跃 / 重对齐(RMC) / 整秒滑移 / RMC 失配 / 传输跨秒 |
 | `lag=48ms` | NMEA 语句起始相对其 PPS 边沿的滞后 |
 | `heap=217KB` | 空闲堆内存 |
@@ -231,6 +285,7 @@ I (48026284) mon: LINK UP  192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED   st
 - **接了 5 Hz / 10 Hz 模块后锁不上、或串口像"堵住"**：先看日志里的 `nmea=OK/BAD` 与 `baud=`。每秒只应采纳 1 组整数秒报文（约 10 条）；若 `OK` 每秒增长远少于这个数、而 `BAD` 持续增长，说明**串口物理带宽不够**（例：5 Hz 全语句 @ 9600 约 3 KB/s，而 9600 只有约 0.96 KB/s，必然丢字节），固件的整段筛选救不了 —— 需要把模块改到 115200，或用厂商工具 / UBX-CFG 把输出降到 1 Hz、裁掉 VTG/GSA/GLL/GSV。带宽足够时（例如 115200），整段筛选会正常完成对齐与锁定。
 - **串口偶发 `N 秒未收到合法 NMEA，重新探测波特率`**：这是模块掉电重启 / 被换 / 波特率被改之后的自愈动作（`CFG_GPS_RELOCK_SEC`，默认 15 s）。探测是只读的、失败会恢复原波特率；嫌频繁可调大该值，设 0 关闭。
 - **运行数小时后突然 `UNLOCKED`，日志反复出现 `RMC 被丢弃（status 不是 A（模块报告定位无效））`**：这是**模块侧**掉了定位，不是固件问题 —— 报文里 RMC 的 status 是 `V`、GGA 的 `fixq=0`/`sats=0`，有些模块还会连 PPS 一起停（表现为 `pps=` 不再增长、`hold` 一路涨大）。固件此时会**按设计拒绝采纳它的时间**：RMC 直接丢弃；GGA 兜底额外要求当前定位合格（`fix_ok`）且与钟面相差 ≤1 s；即使偏差恰好是整数秒，只要超过 `CFG_NMEA_SLIP_MAX_SEC`（默认 600 s）也不会"滑移"对齐，只丢弃并告警。模块重新拿到定位后会自动恢复。
+- **想确认"模块到底在说什么"**：用 `nc <设备IP> 8880`（或串口调试助手的 TCP Client 模式）直接看 GNSS 串口的原始字节流，见上文"远程查看 GNSS 原始报文（TCP/8880）"——这是区分"模块拿不到定位"与"模块/串口根本没在工作"最快的手段。
 - **HTTP 页面读取失败**：查看 `/status.json` 是否为合法 JSON，先用串口日志确认服务已起。
 
 ---
@@ -312,6 +367,14 @@ with a built-in real-time Web monitoring panel.
   flapping.
 - **Web monitoring panel**: live lock state, phase error, frequency correction, satellite count,
   holdover, etc., plus the last **15 raw GNGGA / GNGSA / GNZDA sentences** for troubleshooting.
+- **Remote access to the raw GNSS sentences (a troubleshooting lifeline)**: the **raw byte stream**
+  from the GNSS UART (NMEA text + the module's binary UBX replies + sentences that fail their
+  checksum + the garbage seen while probing baud rates) is forwarded verbatim to **TCP/8880**, so a
+  serial assistant / `telnet` / `nc` anywhere on the LAN can "attach" to the module's serial port and
+  see what it is really saying — no need to sit next to the device with a USB-TTL adapter. When you
+  judge module health, the panel is the *conclusion* and this stream is the *primary evidence*. Zero
+  impact on timing: the GPS task only adds one lock-free `memcpy`, all socket I/O happens in a
+  dedicated task on the network core (see `gnss_tcp.c`).
 - **Task Watchdog (TWDT)**: panics and reboots after 10s without a heartbeat, preventing silent hangs.
 
 ---
@@ -344,6 +407,7 @@ Network address: **DHCP**.
  │  • Time-base PLL/FLL     │      │  • lwIP tcpip thread      │
  │  • GPS UART + NMEA parse │      │  • NTP socket task        │
  │                          │      │  • HTTP monitor server    │
+ │                          │      │  • GNSS raw TCP forwarder │
  └──────────────────────────┘      └──────────────────────────┘
          ▲  PPS / NMEA                    ▲  ETH / NTP / HTTP
          │  (time-sensitive, exclusive)  │  (same core as tcpip)
@@ -363,6 +427,7 @@ Module layout (`main/`):
 | `ntp.c`     | NTPv4 server (RFC 5905), token bucket, inbound timestamp      |
 | `eth_if.c`  | LAN8720 RMII driver, DHCP, link-down rebuild, inbound frame timestamp |
 | `monitor.c` | Web status panel + serial diagnostics                        |
+| `gnss_tcp.c` | TCP forwarder for the raw GNSS UART stream (TCP/8880, remote serial debug) |
 
 ---
 
@@ -403,6 +468,7 @@ idf.py build
 - `CONFIG_LWIP_UDP_RECVMBOX_SIZE=32`: deeper UDP receive queue to avoid burst packet loss.
 - `CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y`: lwIP tcpip thread pinned to CPU1 (network core).
 - `CONFIG_LWIP_SO_RCVBUF=y`: allow `setsockopt(SO_RCVBUF)`.
+- `CONFIG_LWIP_MAX_SOCKETS=16`: total sockets (HTTP panel 5 + NTP 1 + GNSS raw TCP forwarder: 1 listener + clients).
 - `CONFIG_ESP_TASK_WDT_EN=y` / `INIT=n`: `app_main()` calls `esp_task_wdt_init()` explicitly.
 
 ---
@@ -429,6 +495,8 @@ Most behavior can be tuned in `config.h` without touching logic:
 | `CFG_PPB_LIMIT`                | `100000` | Frequency correction clamp (ppb, ±100 ppm)    |
 | `CFG_NTP_SO_RCVBUF`            | `16384` | NTP socket receive buffer                      |
 | `CFG_NTP_RATE_PPS` / `BURST`   | `400`/`800` | Token-bucket avg / burst rate              |
+| `CFG_GNSS_TCP_ENABLE` / `PORT` | `1`/`8880` | TCP forwarder for the raw GNSS UART stream (remote serial debug; `0` disables) |
+| `CFG_GNSS_TCP_MAX_CLIENTS` / `RING` | `3`/`4096` | Max simultaneous clients / ring buffer size in bytes (power of two) |
 | `CFG_CORE_TIME` / `CFG_CORE_NET` | `0`/`1` | Dual-core split (both 0 under UNICORE)     |
 
 ---
@@ -445,8 +513,59 @@ every 2 seconds and shows:
 - **Servo event counters**: step / resync / slip / mismatch / late (for troubleshooting; a steadily
   rising value means the timing link has a problem)
 - **Last 15 raw sentences**: GNGGA / GNGSA / GNZDA, to verify fix and timing
+- **NMEA TCP client count**: how many connections are watching the raw byte stream on TCP/8880
 
 The same data is available as JSON at `http://<device-ip>/status.json` (for scripts / monitoring).
+
+---
+
+## Viewing the Raw GNSS Output Remotely (TCP/8880)
+
+The device forwards the **raw bytes the GNSS module puts on its UART** (identical to what appears on
+the wire) to **TCP 8880**, so from another machine you can "attach" to the module's serial port and
+tell whether it is working or stone dead:
+
+```bash
+# Linux / macOS / Windows (WSL); on Windows you can also use a serial assistant in TCP Client mode
+nc 192.168.1.50 8880
+# or
+telnet 192.168.1.50 8880
+```
+
+On connect you first get 2–3 `#`-prefixed lines (current baud rate, fix state, whether the time base
+is locked), then the module's raw output:
+
+```
+# GNSS raw TCP feed - the bytes below come from the GNSS UART as-is
+# 2026-09-15 04:00:31 UTC | baud=115200 fixq=1 sats=9/11 FIX
+# Lines starting with '#' are added by this server, not by the GNSS module.
+$GNRMC,040031.00,A,3959.12345,N,11618.54321,E,0.021,,150926,,,A,V*33
+$GNGGA,040031.00,3959.12345,N,11618.54321,E,1,09,1.02,45.3,M,-8.4,M,,*6A
+...
+```
+
+Notes:
+
+- **Byte-for-byte identical to the serial port**: besides NMEA text you also see the module's binary
+  UBX replies (e.g. the `CFG-PRT` ACK/NAK during the boot speed-up), sentences that fail their
+  checksum, and the garbage received while probing baud rates — exactly the evidence you need when
+  troubleshooting.
+- **Outbound only**: the server never parses anything a client sends (bytes are discarded; reads are
+  used only to detect a disconnect).
+- **No impact on timing**: the GPS task only does one extra lock-free `memcpy`; all socket I/O lives in
+  a dedicated task on CPU1. The panel's `NMEA TCP port/conns/sent/drop` row confirms the forwarding.
+- At most `CFG_GNSS_TCP_MAX_CLIENTS` clients (default 3); a client that reads too slowly is simply
+  disconnected (it cannot slow the others down — just reconnect). With no client connected the ring
+  buffer is not occupied and no drops are counted.
+- To disable: set `CFG_GNSS_TCP_ENABLE` to `0` (even the byte hand-off is compiled out).
+
+**Typical use** — telling three conditions apart that all look like "it's broken":
+
+| Observation | Conclusion |
+|-------------|------------|
+| A complete, checksum-valid NMEA stream, but `sats=0` and RMC `status='V'` | Supply / UART / baud rate are all fine — **it simply has no fix** (antenna, sky view, interference) |
+| Not a single byte, or only garbage | Wrong baud rate, bad serial wiring/solder joint, or the module has no power — nothing to do with the fix |
+| Only occasional bytes, NMEA lines often truncated, panel `nmea_bad` rising | The serial link is physically saturated (e.g. 5 Hz with all sentences @9600) — raise the baud rate or trim the output |
 
 ---
 
@@ -475,7 +594,7 @@ chronyc sources -v
 `monitor.c`. Below is a **locked** device's real output (values excerpted from an actual run):
 
 ```
-I (48026284) mon: LINK UP  192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED   stratum=1 li=0 | off=0us jit=1us ppb=5004 | hold=956ms pps=189414/0 | sats=9/11 fixq=1 hdop=2.5 [FIX] | baud=115200 cfg=1 nmea=1234/0 rmc=1180/1170/0/5 gga=0 | ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0 | rxTs 8/0 | linkup=1 | sv 1/1/2/1/128 | lag=48ms | heap=217KB
+I (48026284) mon: LINK UP  192.168.6.201 | UTC 2026-09-15 04:00:31 | LOCKED   stratum=1 li=0 | off=0us jit=1us ppb=5004 | hold=956ms pps=189414/0 | sats=9/11 fixq=1 hdop=2.5 [FIX] | baud=115200 cfg=1 nmea=1234/0 rmc=1180/1170/0/5 gga=0 | ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0 | rxTs 8/0 | linkup=1 | nmeaTcp 1/1/0 | sv 1/1/2/1/128 | lag=48ms | heap=217KB
 ```
 
 Field-by-field meaning:
@@ -493,6 +612,7 @@ Field-by-field meaning:
 | `ntp req=8 resp=8 unsync=0 bad=0 drop=0 txfail=0` | NTP requests / responses / **valid but not answered (no time base yet)** / invalid / dropped by token bucket / send failures |
 | `rxTs 8/0` | Times the driver-layer inbound hardware timestamp was used / fell back to socket time |
 | `linkup=1` | Cumulative link-UP count (keeps rising if the link is still flapping) |
+| `nmeaTcp 1/1/0` | GNSS raw-sentence TCP forwarder (`CFG_GNSS_TCP_*`): **current clients / total connections / bytes dropped from the ring buffer**. A steadily rising drop count means a client is reading too slowly (it gets disconnected) |
 | `sv 1/1/2/1/128` | Servo events: step / resync (RMC) / integer-second slip / RMC mismatch / cross-second |
 | `lag=48ms` | Lag of the NMEA sentence start relative to its PPS edge |
 | `heap=217KB` | Free heap memory |
@@ -527,6 +647,10 @@ Field-by-field meaning:
 - **Occasional `N 秒未收到合法 NMEA，重新探测波特率` in the log**: that is the self-healing path
   (`CFG_GPS_RELOCK_SEC`, default 15 s) triggered when the module was power-cycled / swapped or its
   baud rate changed. Probing is read-only and restores the previous baud rate on failure.
+- **Want to see what the module is actually saying**: use `nc <device-ip> 8880` (or a serial
+  assistant in TCP Client mode) to watch the raw GNSS UART byte stream — see
+  [Viewing the Raw GNSS Output Remotely](#viewing-the-raw-gnss-output-remotely-tcp8880) above. It is
+  the fastest way to separate "the module has no fix" from "the module/UART is not working at all".
 - **HTTP page fails to load**: check whether `/status.json` is valid JSON; first confirm the service
   started via the serial log.
 

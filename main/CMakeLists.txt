@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c" "discipline.c" "gps.c" "ntp.c" "eth_if.c" "monitor.c"
+    SRCS "main.c" "discipline.c" "gps.c" "gnss_tcp.c" "ntp.c" "eth_if.c" "monitor.c"
     INCLUDE_DIRS "."
     REQUIRES esp_common
              esp_eth

@@ -8,6 +8,12 @@
  *   - 以太网     : 板载 LAN8720（IO16=50MHz 振荡器使能，IO0=外部 REF_CLK 输入，
  *                   IO23 MDC / IO18 MDIO，PHY nRST 未接 GPIO）
  *   - IP         : DHCP 自动获取（原 192.168.6.201 静态地址已改为 DHCP）
+ *
+ * 对外服务
+ *   - NTP  : UDP/123
+ *   - Web  : HTTP/80（状态面板）
+ *   - 排障 : TCP/8880 —— GNSS 串口原始字节流（含 UBX 二进制）原样转发，
+ *            远程用串口调试助手/telnet 连上来看模块真实输出，见 gnss_tcp.c
  */
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
@@ -26,6 +32,7 @@
 #include "config.h"
 #include "discipline.h"
 #include "gps.h"
+#include "gnss_tcp.h"
 #include "ntp.h"
 #include "eth_if.h"
 #include "monitor.h"
@@ -126,11 +133,18 @@ void app_main(void)
 
     gps_init();
     ntp_server_start();
+    gnss_tcp_start();       /* GNSS 原始报文 TCP 转发（远程串口调试用） */
     monitor_start();
 
+#if CFG_GNSS_TCP_ENABLE
+    ESP_LOGI(TAG, "全部服务已启动: NTP/UDP%d, GNSS 原始报文 TCP/%d, "
+                  "Web 面板 http://<DHCP 分配的 IP>/",
+             CFG_NTP_PORT, CFG_GNSS_TCP_PORT);
+#else
     ESP_LOGI(TAG, "全部服务已启动: NTP/UDP%d, Web 面板 http://<DHCP 分配的 IP>/",
              CFG_NTP_PORT);
-    ESP_LOGI(TAG, "双核分工: CPU%d=时基/PPS/GPS, CPU%d=以太网/lwIP/NTP/HTTP",
+#endif
+    ESP_LOGI(TAG, "双核分工: CPU%d=时基/PPS/GPS, CPU%d=以太网/lwIP/NTP/HTTP/GNSS-TCP",
              CFG_CORE_TIME, CFG_CORE_NET);
 
     while (1) {
