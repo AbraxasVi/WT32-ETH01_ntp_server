@@ -87,6 +87,12 @@ static uint32_t to_unix(int y, int mo, int d, int h, int mi, int s)
         days += is_leap(yy) ? 366 : 365;
     }
     for (int m = 1; m < mo; m++) {
+        /* 纵深防御：调用方必须先用 nmea_datetime_is_valid() 校验。这里再挡
+         * 一次，因为 m 一旦超过 12 就会读出 s_dim[] 之外的内存（月份字段是
+         * "%2d"，最大 99），那是未定义行为，不是"算错时间"这么简单。 */
+        if (m > 12) {
+            break;
+        }
         days += s_dim[m - 1];
         if (m == 2 && is_leap(y)) {
             days += 1;
@@ -94,6 +100,22 @@ static uint32_t to_unix(int y, int mo, int d, int h, int mi, int s)
     }
     days += d - 1;
     return (uint32_t)days * 86400u + (uint32_t)h * 3600u + (uint32_t)mi * 60u + (uint32_t)s;
+}
+
+/* NMEA 的时间/日期字段必须落在合法范围内才允许参与对时。
+ * 只判长度 + sscanf 成功是不够的："%2d" 能把 "99" 读进来，月份越界会让
+ * to_unix() 越界索引 s_dim[]，时分秒越界则会凭空算出一个时间戳。这类报文
+ * 要么来自模块异常，要么是串口误码，都不该被当作时间来源。 */
+static bool nmea_datetime_is_valid(int y, int mo, int d, int h, int mi, int s)
+{
+    if (y < 1970 || y > 2099 || mo < 1 || mo > 12) {
+        return false;
+    }
+    int dim = s_dim[mo - 1] + ((mo == 2 && is_leap(y)) ? 1 : 0);
+    return d >= 1 && d <= dim &&
+           h >= 0 && h <= 23 &&
+           mi >= 0 && mi <= 59 &&
+           s >= 0 && s <= 60;          /* 60 = 闰秒 */
 }
 
 /* GPS-UTC 闰秒跳变表（生效日期 -> 之后的 GPS-UTC 差值）。
@@ -344,6 +366,12 @@ static void parse_rmc(const char *line, uint64_t sentence_start_tb)
         return;
     }
     int y = (YY < 70) ? (2000 + YY) : (1900 + YY);
+    /* 校验必须做在 to_unix() 之前：它内部要用月份索引 s_dim[12]，
+     * 而 "%2d" 能读进 0~99，月份越界就是数组越界读。 */
+    if (!nmea_datetime_is_valid(y, MO, DD, hh, mm, ss)) {
+        rmc_reject("时间/日期字段超出合法范围", line);
+        return;
+    }
     uint32_t unix_sec = to_unix(y, MO, DD, hh, mm, ss);
     discipline_on_nmea_second(unix_sec, sentence_start_tb);
     s_st.rmc_ok++;
@@ -384,7 +412,8 @@ static void parse_gga(const char *line)
     if (s_rmc_ok_tb != 0 && s_st.fix_valid &&
         (tb_now_us() - s_rmc_ok_tb) > 3000000ULL) {
         int hh, mm, ss;
-        if (strlen(s_f[1]) >= 6 && sscanf(s_f[1], "%2d%2d%2d", &hh, &mm, &ss) == 3) {
+        if (strlen(s_f[1]) >= 6 && sscanf(s_f[1], "%2d%2d%2d", &hh, &mm, &ss) == 3 &&
+            nmea_datetime_is_valid(s_utc_y, s_utc_mo, s_utc_d, hh, mm, ss)) {
             uint32_t sec = to_unix(s_utc_y, s_utc_mo, s_utc_d, hh, mm, ss);
             uint32_t now_sec, now_frac;
             if (discipline_get_utc(tb_now_us(), &now_sec, &now_frac) &&

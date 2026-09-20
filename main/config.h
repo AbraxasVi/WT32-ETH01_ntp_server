@@ -196,8 +196,33 @@ extern "C" {
 /* 精度字段：esp_timer 分辨率为 1 µs -> 2^-20 s ≈ 0.95 µs */
 #define CFG_NTP_PRECISION      (-20)
 
-/* 未锁定 / 长期失锁时的 Root Dispersion 基准（µs） */
+/* ======================= Root Dispersion 构成 ======================
+ * 对外宣告的 Root Dispersion（RFC 5905 的 ε）由三部分组成：
+ *
+ *   Root Dispersion = CFG_NTP_BASE_DISP_US        （打戳/路径的固定不确定度）
+ *                   + 2 × jitter                  （PPS 相位残差 EMA，约 2σ）
+ *                   + 守时漂移（仅 PPS 不新鲜时按 CFG_HOLD_DRIFT_PPM 累积）
+ *
+ * 它直接决定客户端看到的 Root Distance（≈ Root Delay/2 + Root Dispersion），
+ * 而 Root Distance 是 clock_select 排序、剔除（ntpd 的 TEST11 / MAXDIST
+ * = 1.5 s）与 chrony 选源（maxdistance，默认 3 s）的判据，调大它等于主动
+ * 降低自己作为时间源的可用性，别为了"保守"随手加。
+ * ------------------------------------------------------------------ */
+
+/* 固定不确定度基准（µs）：esp_timer 分辨率、以太网驱动打戳、lwIP 路径、
+ * PPS 边沿->整秒对齐合起来的量级，1 ms 是这一档实现的合理取值。 */
 #define CFG_NTP_BASE_DISP_US   1000
+
+/* Root Dispersion 封顶（µs）= 10 s。用于"从未建立绝对时间基准/长时间失锁"
+ * 这类确实不可信的状态 —— 这个值本身就是"别选我"的信号，不要改小。 */
+#define CFG_NTP_DISP_MAX_US    10000000u
+
+/* 守时（holdover）漂移率，ppm：1 ppm == 1 µs/s。PPS 丢失后钟面按此速率
+ * 累积误差，Root Dispersion 随之线性增长（1000 s -> 10 ms）。
+ * ESP32 无源 40 MHz 晶振初始精度约 ±10 ppm、温漂约 ±20 ppm；进入 holdover
+ * 时 s_ppb 已吸收了当时的频差，残余主要来自温度变化，10 ppm 属保守估计。
+ * 调大 = 更早被判不可信；调小 = 更乐观。 */
+#define CFG_HOLD_DRIFT_PPM     10
 
 /* Holdover 分级（秒） */
 #define CFG_HOLD_STRATUM2_S    5      /* 超时 -> stratum 2  */

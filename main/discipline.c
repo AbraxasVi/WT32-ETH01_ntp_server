@@ -52,7 +52,7 @@ static volatile uint64_t s_lock_since_tb;   /* 最近一次建立锚点的时刻
 static volatile int64_t  s_prev_off;        /* 上一次的残余相位误差 */
 static volatile bool     s_have_prev;
 static volatile int64_t  s_offset_us;
-static volatile int64_t  s_jitter_q3;       /* |offset| 的 EMA，放大 8 倍 */
+static volatile int64_t  s_jitter_q3;       /* 8 × |offset| 的 EMA（读回时 /8） */
 
 static volatile uint64_t s_nmea_time_tb;    /* 最近一条有效 RMC 秒 */
 static volatile uint64_t s_fix_tb;          /* 最近一次合格定位（GGA） */
@@ -66,18 +66,18 @@ static volatile uint32_t s_cnt_mismatch;
 static volatile uint32_t s_cnt_late;
 static volatile uint32_t s_lag_us;      /* 最近一次配对的 NMEA 滞后（µs） */
 
-/* ---- 任务侧派生状态 ---- */
-/* 注意：s_seen_gga 由 GPS 任务在 discipline_on_fix() 里写、被其它任务经
- * refresh_flags() 读，因此与 s_fix_tb 一样需要 volatile（跨任务可见性）。 */
-static bool     s_pps_ok;
-static bool     s_nmea_ok;
-static bool     s_fix_ok;
-static bool     s_fix_gate;       /* 是否把 GGA 定位质量当作硬条件（见 refresh_flags） */
+/* ---- 任务侧派生状态 ----
+ * s_seen_gga 由 GPS 任务在 discipline_on_fix() 里写、被其它任务在
+ * refresh_flags() 里读，因此与 s_fix_tb 一样需要 volatile（跨任务可见性）。
+ *
+ * 其余派生量（pps_ok / nmea_ok / fix_ok / locked / holdover_*）一律不再
+ * 放进全局：它们由 refresh_flags() 在锁内按同一个 now 算出来后直接写进
+ * 调用方的 st。以前它们是一组 static，而 discipline_get_status() 会被 NTP
+ * 任务、HTTP 面板任务、伺服任务并发调用，两个任务会互相覆盖 —— st 里就会
+ * 出现"用不同 now 算出的半新半旧组合"（例如 pps_ok=true 却配一个已经超时
+ * 的 holdover_ms），而 stratum / LI / Root Dispersion 的判定全都依赖它们。 */
 static volatile bool s_seen_gga;  /* 是否收到过 GGA（有些模块只输出 RMC） */
-static bool     s_locked;
-static uint32_t s_holdover_ms;
-static bool     s_hold_valid;     /* 是否收到过 PPS */
-static bool     s_was_locked;
+static bool     s_was_locked;     /* 仅伺服任务用：锁定状态翻转时打印一次 */
 
 uint64_t IRAM_ATTR tb_now_us(void)
 {
@@ -169,9 +169,13 @@ void IRAM_ATTR discipline_on_pps(uint64_t tb)
             s_have_prev     = true;
         }
 
-        /* 抖动滑动平均（|offset|，放大 8 倍保存） */
+        /* 抖动滑动平均：q 保存 8 × EMA(|offset|)，读回时 /8。
+         * 递推式是 q ← (1 - 1/8)·q + 输入，其不动点 = 8 × 输入，
+         * 所以输入必须是 a 本身。以前写成 a * 8，等于把 EMA 又放大 8 倍：
+         * 面板的 jitter 与 Root Dispersion 的抖动项都虚高 8 倍，
+         * 纯相位噪声也会被报成几十毫秒的离散度。 */
         int64_t a = off < 0 ? -off : off;
-        s_jitter_q3 = s_jitter_q3 - (s_jitter_q3 / 8) + a * 8;
+        s_jitter_q3 = s_jitter_q3 - (s_jitter_q3 / 8) + a;
     }
 
     portEXIT_CRITICAL_ISR(&s_lock);
@@ -406,32 +410,40 @@ bool discipline_get_utc(uint64_t tb_us, uint32_t *sec, uint32_t *frac32)
 }
 
 /* ============================ 状态查询 ============================= */
-static void refresh_flags(uint64_t now)
+/* 必须持 s_lock 调用：s_last_pps_tb / s_nmea_time_tb / s_fix_tb 都是 64 位
+ * volatile，在 32 位核上会被写方撕裂；锁外读可能得到相差 2^32 µs 的值，
+ * 表现为偶发地把健康的钟判成"PPS 超时"。结果只写调用方的 st，不碰全局。 */
+static void refresh_flags(uint64_t now, disc_status_t *st)
 {
-    s_pps_ok  = (s_last_pps_tb != 0) &&
-                (TB_DELTA(now, s_last_pps_tb) < (uint64_t)CFG_PPS_TIMEOUT_MS * 1000ULL);
-    s_nmea_ok = (s_nmea_time_tb != 0) &&
-                (TB_DELTA(now, s_nmea_time_tb) < (uint64_t)CFG_FIX_TIMEOUT_MS * 1000ULL);
-    s_fix_ok  = (s_fix_tb != 0) &&
-                (TB_DELTA(now, s_fix_tb) < (uint64_t)CFG_FIX_TIMEOUT_MS * 1000ULL);
-    /* 有些模块被裁成只输出 RMC（GGA 关闭）——那种情况下 s_fix_ok 永远是 false，
+    bool pps_ok  = (s_last_pps_tb != 0) &&
+                   (TB_DELTA(now, s_last_pps_tb) < (uint64_t)CFG_PPS_TIMEOUT_MS * 1000ULL);
+    bool nmea_ok = (s_nmea_time_tb != 0) &&
+                   (TB_DELTA(now, s_nmea_time_tb) < (uint64_t)CFG_FIX_TIMEOUT_MS * 1000ULL);
+    bool fix_ok  = (s_fix_tb != 0) &&
+                   (TB_DELTA(now, s_fix_tb) < (uint64_t)CFG_FIX_TIMEOUT_MS * 1000ULL);
+    /* 有些模块被裁成只输出 RMC（GGA 关闭）——那种情况下 fix_ok 永远是 false，
      * 把它当硬条件会让设备永远停在 stratum 16。所以只有确实见过 GGA 时，
      * 才把"定位质量"当作判据。 */
-    s_fix_gate = s_seen_gga ? s_fix_ok : true;
-    s_locked   = s_anchored && s_pps_ok && s_nmea_ok && s_fix_gate;
+    bool fix_gate = s_seen_gga ? fix_ok : true;
+
+    st->pps_ok  = pps_ok;
+    st->nmea_ok = nmea_ok;
+    st->fix_ok  = fix_ok;
+    st->locked  = s_anchored && pps_ok && nmea_ok && fix_gate;
 
     /* 从未收到过 PPS 时，holdover 没有意义：以前这里填 0xFFFFFFFF
      * （显示为 4294967295ms ≈ 49 天），既不是真值也容易误判成"失锁很久"，
      * 改成 0 + holdover_valid=false。 */
-    s_hold_valid  = (s_last_pps_tb != 0);
-    s_holdover_ms = s_hold_valid
-                        ? (uint32_t)(TB_DELTA(now, s_last_pps_tb) / 1000ULL)
-                        : 0u;
+    st->holdover_valid = (s_last_pps_tb != 0);
+    st->holdover_ms    = st->holdover_valid
+                             ? (uint32_t)(TB_DELTA(now, s_last_pps_tb) / 1000ULL)
+                             : 0u;
 }
 
 void discipline_get_status(disc_status_t *st)
 {
     uint64_t now = tb_now_us();
+    bool     seen_gga;
 
     portENTER_CRITICAL(&s_lock);
     st->anchored     = s_anchored;
@@ -446,24 +458,18 @@ void discipline_get_status(disc_status_t *st)
     st->mismatch_count = s_cnt_mismatch;
     st->late_count     = s_cnt_late;
     st->lag_ms         = s_lag_us / 1000U;
+    seen_gga         = s_seen_gga;
+    refresh_flags(now, st);          /* 同一临界区、同一个 now */
     portEXIT_CRITICAL(&s_lock);
-
-    refresh_flags(now);
-
-    st->pps_ok       = s_pps_ok;
-    st->nmea_ok      = s_nmea_ok;
-    st->fix_ok       = s_fix_ok;
-    st->locked       = s_locked;
-    st->holdover_ms  = s_holdover_ms;
-    st->holdover_valid = s_hold_valid;
 
     /* 没有绝对时间来源（没对齐过 / 长时间没拿到有效 RMC / 定位不合格）就不能
      * 自称 stratum 1。判据与 locked 保持一致，避免出现"面板显示 UNLOCKED、
      * 却对外宣告 stratum=1 / LI=0"这种自相矛盾的状态。 */
-    if (!st->anchored || !st->nmea_ok || !s_fix_gate) {
+    bool fix_gate = seen_gga ? st->fix_ok : true;
+    if (!st->anchored || !st->nmea_ok || !fix_gate) {
         st->stratum      = 16;
         st->li           = 3;                       /* 未同步 */
-        st->root_disp_us = 10000000;                /* 10 s */
+        st->root_disp_us = CFG_NTP_DISP_MAX_US;     /* 10 s，等于"别选我" */
         return;
     }
     if (st->pps_ok && st->holdover_ms < ((uint32_t)CFG_HOLD_STRATUM2_S * 1000u)) {
@@ -477,14 +483,42 @@ void discipline_get_status(disc_status_t *st)
         st->li      = 3;
     }
 
-    uint32_t disp = CFG_NTP_BASE_DISP_US + (uint32_t)(st->jitter_us * 2);
-    if (st->holdover_valid) {
-        disp += st->holdover_ms / 10u;              /* 允许 100 ppb 的守时漂移 */
-    } else {
-        disp = 10000000u;                           /* 从未对过钟，保守给 10 s */
+    /* Root Dispersion（RFC 5905 的 ε）：本机钟面相对参考的最大误差估计，
+     * 也是下游算 Root Distance 的一半（Root Delay 我们填 0）。三部分：
+     *
+     *   1) 固定基准：打戳分辨率 + 驱动/lwIP 路径 + PPS 边沿对齐的不确定度
+     *   2) 抖动项：PPS 相位残差 EMA 的 2 倍。|off| 由 round-to-nearest 限定
+     *      在半秒以内，这里再夹一次 —— 一是挡住异常值，二是避免
+     *      jitter_us 万一为负时 (uint32_t) 转换回绕成天文数字。
+     *   3) 守时项：**只在 PPS 不新鲜时**按晶振守时漂移率线性累积。
+     *
+     * 第 3 项以前是无条件累加 holdover_ms/10 的：注释写着 100 ppb，实际
+     * 速率却是 100 ppm（相差 1000 倍）。后果是两头都错 ——
+     *   - PPS 正常时，holdover_ms 是"距上次 PPS 的毫秒数"（1 Hz 下 0~1000），
+     *     于是每秒钟的 Root Dispersion 都在 0~100 µs 之间随机跳动，把一个
+     *     纯噪声量当成了钟的误差；
+     *   - 真正失锁时又按 100 ppm 飞涨（1000 s 就 100 ms，2.8 h 就到 1 s），
+     *     与 ESP32 晶振 ppm 量级的真实守时能力严重不符，足够把客户端
+     *     对 Root Distance 的评估拖到 MAXDIST / maxdistance 边缘。 */
+    int64_t jit_us = st->jitter_us;
+    if (jit_us < 0) {
+        jit_us = 0;
+    } else if (jit_us > 500000) {
+        jit_us = 500000;                            /* |off| 的半秒硬上界 */
     }
-    if (disp > 10000000u) {
-        disp = 10000000u;
+    uint32_t disp = CFG_NTP_BASE_DISP_US + (uint32_t)(jit_us * 2);
+
+    if (!st->holdover_valid) {
+        disp = CFG_NTP_DISP_MAX_US;                 /* 从未见过 PPS，保守取上限 */
+    } else if (!st->pps_ok) {
+        uint64_t drift = ((uint64_t)st->holdover_ms * (uint64_t)CFG_HOLD_DRIFT_PPM) / 1000ULL;
+        if (drift > (uint64_t)CFG_NTP_DISP_MAX_US) {
+            drift = (uint64_t)CFG_NTP_DISP_MAX_US;
+        }
+        disp += (uint32_t)drift;
+    }
+    if (disp > CFG_NTP_DISP_MAX_US) {
+        disp = CFG_NTP_DISP_MAX_US;
     }
     st->root_disp_us = disp;
 }
@@ -543,7 +577,6 @@ void discipline_init(void)
     s_cnt_late      = 0;
     s_lag_us        = 0;
     s_seen_gga      = false;
-    s_fix_gate      = true;
 
     /* 时基链路固定在 CORE_TIME：PPS 中断就在同一个核上，
      * 不会被 lwIP / HTTP 的长临界区推迟 */

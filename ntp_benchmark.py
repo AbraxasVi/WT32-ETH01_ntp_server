@@ -139,7 +139,10 @@ def compute_stats(samples: list) -> dict:
     rtt_std = statistics.pstdev(rtts) if n_ok > 1 else 0.0
     offset_avg = statistics.fmean(offs)
     jitter = statistics.pstdev(offs) if n_ok > 1 else 0.0
-    root_disp = statistics.fmean([s.get("root_disp", 0.0) for s in ok]) * 1000.0
+    # 注意单位：样本入库时（见下方采集循环 "root_disp": r["root_disp"] * 1000.0）
+    # 已经把秒换成了毫秒，这里只能取均值，不能再乘 1000 ——
+    # 曾经多乘一次，把「根离散」整列放大 1000 倍（1 ms 显示成 1 s 量级）。
+    root_disp = statistics.fmean([s.get("root_disp", 0.0) for s in ok])
     score = rtt_avg + jitter  # 越小越好
     return {
         "ok": n_ok, "total": n_total, "status": "完成",
@@ -287,7 +290,7 @@ class Benchmark:
             w.writerow([
                 srv["host"], srv["status"], st["ok"], st["total"], st["stratum"], st["ref"],
                 _fmt(st["rtt_avg"]), _fmt(st["rtt_min"]), _fmt(st["rtt_max"]), _fmt(st["rtt_std"]),
-                _fmt(st["offset_avg"]), _fmt(st["jitter"]), _fmt(st["root_disp"]), _fmt(st["score"]),
+                _fmt(st["offset_avg"]), _fmt(st["jitter"]), _fmt(st["root_disp"], 3), _fmt(st["score"]),
             ])
         return buf.getvalue()
 
@@ -836,7 +839,7 @@ function renderTable(servers){
       '<td>'+fmt(st.rtt_max)+'</td>'+
       '<td>'+fmt(st.offset_avg,3)+'</td>'+
       '<td>'+fmt(st.jitter,3)+'</td>'+
-      '<td>'+fmt(st.root_disp)+'</td>'+
+      '<td>'+fmt(st.root_disp,3)+'</td>'+
       '<td>'+fmt(st.score)+'</td>'+
       '<td>'+(s.rank!=null?('<span class="rank '+rankCls+'">'+s.rank+'</span>'):"-")+'</td>';
     tb.appendChild(tr);
