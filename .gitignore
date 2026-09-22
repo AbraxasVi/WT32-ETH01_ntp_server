@@ -9,6 +9,32 @@ compile_commands.json
 # 临时构建检查目录（本项目调试时用过）
 .idf_build_check/
 .tmp/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+install_manifest.txt
+compile_commands.json
+
+# 忽略 Python 字节码文件
+__pycache__/
+*.py[codz]
+*$py.class
+
+# 忽略所有 .log 文件
+*.log
+
+# 忽略常见的虚拟环境目录
+venv/
+env/
+.venv/
 
 # 编辑器 / 工具
 .vscode/
